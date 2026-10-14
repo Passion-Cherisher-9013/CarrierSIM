@@ -51,6 +51,7 @@ class Sandbox:
         self.original = dict(self.catalog)
         self.mode = 'accept'
         self.baseline_key = ALIAS
+        self.iccid = ROWS[1]['IntegratedCircuitCardIdentity']
         self.precommit = None
         self.trigger_error = False
         self.alias_commits = 0
@@ -125,11 +126,15 @@ class Sandbox:
     def alias(self):
         base = '310240_GID1-' + self.args.gid1 if self.args.gid1 else self.baseline_key
         qualified = self.args.gid1_iccid or self.args.tmobile_wholesale
-        return base + '_ID-' + ROWS[1]['IntegratedCircuitCardIdentity'] if qualified else base
+        return base + '_ID-' + self.iccid if qualified else base
 
     def trigger(self, args, assets, work, info, identities, bundle):
         if self.trigger_error:
             raise RuntimeError('No validated trigger in this sandbox')
+        if args.sims != 'all':
+            selected = next((row for row in self.rows if row['Slot'] in carrier.SLOT_CHOICES[args.sims]), None)
+            if selected is not None:
+                self.iccid = selected['IntegratedCircuitCardIdentity']
         path = work / 'gid-trigger.ipcc'
         path.write_bytes(b'isolated transport boundary')
         return path, {'sha256': carrier.digest(path.read_bytes())}
@@ -217,8 +222,18 @@ class Sandbox:
         for row in self.rows:
             index = 1 if row['Slot'] == 'kOne' else 2
             tmobile = row['MCC'] + row['MNC'] == '310240'
-            bundle, op = (selected, operator) if tmobile else (other, other_operator)
-            checked, op_checked = (verification, operator_verification) if tmobile else ('Success', 'Success')
+            qualified = self.args.gid1_iccid or self.args.tmobile_wholesale
+            target = tmobile and (not qualified or row['IntegratedCircuitCardIdentity'] == self.iccid)
+            fallback = 'Verizon_LTE_US.bundle'
+            if tmobile:
+                key = self.alias.split('_ID-', 1)[0]
+                if qualified:
+                    key += '_ID-' + row['IntegratedCircuitCardIdentity']
+                fallback = BUNDLE if key in self.catalog else 'TMobile_MVNO_US.bundle'
+            bundle, op = (selected, operator) if target else (
+                fallback if other == 'Verizon_LTE_US.bundle' else other,
+                fallback if other_operator == 'Verizon_LTE_US.bundle' else other_operator)
+            checked, op_checked = (verification, operator_verification) if target else ('Success', 'Success')
             text += (baseline_log(bundle, self.baseline_key, index) if tmobile and stage.name == 'baseline' else
                      bundle_block(index, bundle, checked))
             if self.mode != 'operator-missing' or stage.name != 'rescan':
@@ -260,11 +275,11 @@ class Sandbox:
         args.tmobile_wholesale = args.remove_tmobile_wholesale = False
         return await carrier.execute_with_retry(args, None)
 
-    async def automatic(self):
+    async def automatic(self, sims='all'):
         self.args.gid1 = None
         self.args.gid1_iccid = False
         self.args.tmobile_wholesale = True
-        self.args.sims = 'all'
+        self.args.sims = sims
         return await self.apply()
 
     async def remove(self, status=False):
@@ -649,6 +664,61 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
                 self.assertEqual(carrier.gid_active(case, sandbox.device.udid), [sandbox.owner()])
 
+    async def test_automatic_explicit_slot_isolates_same_plmn_esims(self):
+        for sims, slot in (('1', 'kOne'), ('2', 'kTwo')):
+            case = self.root / sims
+            case.mkdir()
+            with self.subTest(sims=sims), Sandbox(case) as sandbox:
+                sandbox.rows[0].update(MCC='310', MNC='240', CFBundleIdentifier='com.apple.TMobile_MVNO_US',
+                                       InternationalMobileSubscriberIdentity='310240000000001')
+                selected = next(row for row in sandbox.rows if row['Slot'] == slot)
+                other = next(row for row in sandbox.rows if row['Slot'] != slot)
+                other_before = dict(other)
+                sandbox.baseline_key = '310240_GID1-7A'
+                expected = sandbox.baseline_key + '_ID-' + selected['IntegratedCircuitCardIdentity']
+                self.assertEqual(await sandbox.automatic(sims), 0)
+                record = sandbox.record()
+                self.assertEqual(record['slot'], slot)
+                self.assertEqual(record['baseline_key'], sandbox.baseline_key)
+                self.assertEqual(sandbox.catalog[expected], carrier.bundle_link(BUNDLE))
+                self.assertEqual({name for name in sandbox.catalog if name.startswith(sandbox.baseline_key + '_ID-')},
+                                 {expected})
+                self.assertEqual(selected['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+                self.assertEqual(other, other_before)
+                self.assertEqual(record['result'][slot]['selected'], BUNDLE)
+                self.assertEqual(record['result'][slot]['operator']['selected'], BUNDLE)
+                self.assertEqual(record['result'][other['Slot']], record['baseline'][other['Slot']])
+                self.assertTrue(carrier.gid_healthy(record))
+                self.assertEqual(await sandbox.automatic(sims), 0)
+                self.assertEqual(sandbox.alias_commits, 1)
+                self.assertEqual(sandbox.catalog_writes, 1)
+                self.assertEqual(await sandbox.remove(), 0)
+                self.assertNotIn(expected, sandbox.catalog)
+                self.assertEqual(sandbox.record()['state'], 'undone')
+                self.assertEqual(selected['CFBundleIdentifier'], 'com.apple.TMobile_MVNO_US')
+                self.assertEqual(other, other_before)
+                self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
+                self.assertTrue(all(client.closed for client in sandbox.clients))
+
+    async def test_dual_tmobile_other_carrier_or_operator_change_requires_rollback(self):
+        for sims in ('1', '2'):
+            for mode in ('other-slot', 'operator-other-slot'):
+                case = self.root / (sims + '-' + mode)
+                case.mkdir()
+                with self.subTest(sims=sims, mode=mode), Sandbox(case) as sandbox:
+                    sandbox.rows[0].update(MCC='310', MNC='240', CFBundleIdentifier='com.apple.TMobile_MVNO_US',
+                                           InternationalMobileSubscriberIdentity='310240000000001')
+                    sandbox.mode = mode
+                    with self.assertRaises(RuntimeError):
+                        await sandbox.automatic(sims)
+                    record = sandbox.record()
+                    self.assertEqual(record['state'], 'rolled_back')
+                    self.assertNotIn(record['alias'], sandbox.catalog)
+                    self.assertEqual(sandbox.alias_commits, 1)
+                    self.assertTrue(all(row['CFBundleIdentifier'] == 'com.apple.TMobile_MVNO_US'
+                                        for row in sandbox.rows))
+                    self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
+
     async def test_automatic_preview_never_exports_catalog_or_installs_trigger(self):
         with Sandbox(self.root) as sandbox:
             sandbox.args.status = True
@@ -669,7 +739,8 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                 if kind == 'foreign':
                     sandbox.rows = sandbox.rows[:1]
                 elif kind == 'ambiguous':
-                    sandbox.rows[0]['CFBundleIdentifier'] = 'com.apple.TMobile_MVNO_US'
+                    sandbox.rows[0].update(MCC='310', MNC='240', CFBundleIdentifier='com.apple.TMobile_MVNO_US',
+                                           InternationalMobileSubscriberIdentity='310240000000001')
                 else:
                     sandbox.args.sims = '1' if kind == 'explicit-foreign' else '2'
                     if kind == 'inactive':

@@ -24,9 +24,7 @@ import zipfile
 from carriersim_version import VERSION
 from device_models import MODELS
 
-# A PyInstaller build (CarrierSIM executable) keeps bundle.yaml, assets.zip and runs next to itself.
-FROZEN = getattr(sys, 'frozen', False)
-SELF = Path(sys.executable if FROZEN else __file__).resolve()
+SELF = Path(__file__).resolve()
 ROOT = SELF.parent
 
 PARENT = '/var/mobile/Library/Carrier Bundles'
@@ -1073,7 +1071,7 @@ def local_network_denied(udid):
 
 
 def host_command():
-    return [sys.executable, '--carrier', '--_host'] if FROZEN else [sys.executable, str(SELF), '--_host']
+    return [sys.executable, str(SELF), '--_host']
 
 
 async def host_session(udid, assets, callback, run):
@@ -1581,8 +1579,7 @@ def gid_pending(runs, udid):
 
 def gid_print_undo(owner):
     import shlex
-    command = [str(SELF), '--carrier'] if FROZEN else [sys.executable, str(SELF)]
-    command += ['--undo-gid1', str(owner)]
+    command = [sys.executable, str(SELF), '--undo-gid1', str(owner)]
     print('Explicit undo command:', flush=True)
     print('  ' + (subprocess.list2cmdline(command) if os.name == 'nt' else shlex.join(command)), flush=True)
 
@@ -1955,8 +1952,9 @@ async def execute_gid(args, assets):
                 alias = base_alias
             chosen = identities[slot]
             require(not airlift_may_be_closed(info), 'This build is known to close AirLift; no installation will be attempted.')
-            require(all(s == slot or v['plmn'] != chosen['plmn'] for s, v in identities.items()),
-                    'Another active SIM has the same PLMN; GID overlap cannot safely be excluded.')
+            # Only full ICCID qualification isolates a GID rule from another SIM on the same PLMN.
+            require(iccid_qualified or all(s == slot or v['plmn'] != chosen['plmn'] for s, v in identities.items()),
+                    'Another active SIM has the same PLMN; an unqualified GID rule could affect both.')
             iccid = selected_row['IntegratedCircuitCardIdentity']
             LOG_SECRETS[iccid] = '<iccid>'
             if iccid_qualified and alias is not None:

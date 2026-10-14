@@ -3,6 +3,8 @@
 __pycache__/
 *.py[cod]
 runs/
+/personal/
 
-# Standalone build (.github/scripts/build-standalone.py)
+# Local packaging output
 build/
+dist/

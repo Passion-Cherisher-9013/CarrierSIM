@@ -13,9 +13,7 @@ import tempfile
 import zipfile
 from carriersim_version import VERSION
 
-# In a PyInstaller build the executable is both the launcher and carrier.py (called with --carrier).
-FROZEN = getattr(sys, 'frozen', False)
-ROOT = Path(sys.executable if FROZEN else __file__).resolve().parent
+ROOT = Path(__file__).resolve().parent
 UNCONFIRMED = 3  # carrier.py: written, but iOS did not confirm the chosen bundle
 NOTHING_TO_WRITE = 4  # carrier.py --status with CARRIERSIM_PLAN=1: the plan writes nothing
 
@@ -27,7 +25,7 @@ def run_carrier(python, args, **kwargs):
     # handler, not SIG_IGN: an ignored SIGINT would be inherited and carrier.py could not be stopped.
     previous = signal.signal(signal.SIGINT, lambda *_: None)
     try:
-        command = [str(python), '--carrier'] if FROZEN else [str(python), '-u', str(ROOT / 'carrier.py')]
+        command = [str(python), '-u', str(ROOT / 'carrier.py')]
         return subprocess.run([*command, *args], cwd=ROOT, **kwargs).returncode
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -77,7 +75,6 @@ def install_dependencies(python, version):
 
 
 def python_environment():
-    if FROZEN: return Path(sys.executable)
     if sys.version_info < (3, 11):
         raise RuntimeError('Python 3.11 or newer is required: https://www.python.org/downloads/')
     if sys.platform == 'win32' and sys.maxsize <= 2**32:
@@ -263,10 +260,6 @@ def show_help():
 
 
 def main():
-    if FROZEN and sys.argv[1:2] == ['--carrier']:
-        sys.argv = [sys.argv[0], *sys.argv[2:]]
-        import carrier
-        return carrier.cli()
     os.chdir(ROOT)
     if sys.argv[1:] in (['--help'], ['-h']):
         return show_help()
