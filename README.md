@@ -1,306 +1,462 @@
 # CarrierSIM
 
-[Обсуждение на 4PDA](https://4pda.to/forum/index.php?showtopic=1055886&view=findpost&p=145261196)
+[Discussion on 4PDA](https://4pda.to/forum/index.php?showtopic=1055886&view=findpost&p=145261196)
 
-Скрипт привязывает SIM-карты iPhone по IMSI к системному пакету оператора **Vodafone_hu** или к любому другому пакету, который есть в iOS телефона. Задуман для включения **звонков по Wi-Fi (VoWiFi)** в России. Заодно включается кодек EVS и 5G на части диапазонов.
+CarrierSIM changes SIM-to-bundle rules in the iPhone's user carrier catalog without modifying Apple-signed system bundles. The default IMSI workflow selects **Vodafone_hu** or another existing bundle to enable **Wi-Fi Calling (VoWiFi)** in Russia; it can also enable EVS and 5G on some bands. The separate **automatic T-Mobile Wholesale workflow** supports eligible SIMs, including eSIMs, currently using `TMobile_MVNO_US`.
 
-Python-скрипт работает на **macOS**, **Windows** и **Linux**. Готовые сборки без Python выпускаются для macOS, Windows x64 и Linux x64.
+The Python script runs on **macOS**, **Windows** and **Linux**. Standalone builds that do not require Python are available for macOS, Windows x64 and Linux x64.
 
-Работает на **iPhone 12–18**, включая модели **mini, Pro, Pro Max, Plus, Air и e**, с **iOS 16 и новее**.
+Supports **iPhone 12–18**, including **mini, Pro, Pro Max, Plus, Air and e**, with **iOS 16 or later**.
 
-| iOS | Работает | Не работает |
+| iOS | Works | Does not work |
 | --- | --- | --- |
-| 27.2 | ✅ 27.2 beta 2 (24B5089g) | ❌ $\color{red}{\textsf{начиная с 27.2 beta 3 (24B5099f)}}$ |
+| 27.2 | ✅ 27.2 beta 2 (24B5089g) | ❌ starting with 27.2 beta 3 (24B5099f) |
 | 27.0 | ✅ 27.0.1 (24A446) | — |
 | 26 | ✅ 26.7.1 (23H30) | — |
 | 18 | ✅ 18.7.10 (22H374) | — |
 | 17 | ✅ 17.7.2 (21H221) | — |
 | 16 | ✅ 16.7.16 (20H392) | — |
-| 15 | ❔ не проверялось, 15.8.8 (19H422) | — |
-| 14 | ❔ не проверялось, 14.8.1 (18H107) | — |
+| 15 | ❔ not tested, 15.8.8 (19H422) | — |
+| 14 | ❔ not tested, 14.8.1 (18H107) | — |
 
-Указаны самые свежие сборки каждой ветки по [AppleDB](https://appledb.dev/firmware.html?filter=release;iPhone,+iPod+touch). На iOS 27.2 beta 3 и новее Apple закрыла способ записи: скрипт предупреждает и останавливается, если iPhone откажет в переносе.
+These are the latest builds of each branch listed by [AppleDB](https://appledb.dev/firmware.html?filter=release;iPhone,+iPod+touch). Apple closed the write mechanism in iOS 27.2 beta 3 and later: the normal IMSI workflow warns and stops if the iPhone refuses the transfer. GID1 and automatic Wholesale installation refuse known-closed builds before applying an alias.
 
-**iPad Wi-Fi + Cellular:** нужна активная SIM или eSIM; установка пока не проверена на устройстве. Модели Wi-Fi без сотового модема не поддерживают установку профилей.
+**iPad Wi-Fi + Cellular:** an active SIM or eSIM is required; installation has not yet been tested on a device. Wi-Fi-only models without a cellular modem cannot install profiles.
 
-> Экспериментальный инструмент. Работа на будущих версиях iOS не гарантируется.
+> Compatibility with future iOS/carrier updates is not guaranteed. The ICCID-qualified Wholesale installation selected and verified both carrier and operator bundles on iPhone 18 Pro / iOS 27.0.1; the user subsequently reported that it works and persists through reboot. This does not establish every service, carrier, device or update combination.
 
-## Что нужно
+## Requirements
 
-- **Python 3.11 или новее**, рекомендуется 3.12. На Windows нужна 64-битная версия.
-- **Windows:** установите iTunes x64 по [инструкции на 4PDA](https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362). Версия из Microsoft Store и Apple Devices могут не подойти. Если скачивание на 4PDA выдаёт ошибку 404, нужна регистрация, вход в аккаунт и некоторая активность на форуме.
-- **macOS:** ничего дополнительно ставить не нужно.
-- **Linux:** установите системный `usbmuxd` (например, `sudo apt install usbmuxd` на Debian/Ubuntu). Проверка `--check` покажет, найден ли он и есть ли сокет службы.
-- iPhone, кабель USB и интернет для первого запуска. Потом можно без кабеля, по Wi-Fi (пункт **10**).
+- **Python 3.11 or later**, preferably 3.12. Windows requires 64-bit Python.
+- **Windows:** install iTunes x64 using the [4PDA instructions](https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362). The Microsoft Store version and Apple Devices may not work. A 404 when downloading from 4PDA can mean that registration, login and some forum activity are required.
+- **macOS:** no additional software is required.
+- **Linux:** install the system `usbmuxd` service (for example, `sudo apt install usbmuxd` on Debian/Ubuntu). `--check` reports whether it and its service socket are available.
+- An iPhone, a USB cable and internet access for the first launch. Later, normal IMSI operations can use Wi-Fi (menu item **10**). GID1 and automatic T-Mobile Wholesale installation/removal are **USB-only**.
 
-Если устройство не определяется, разблокируйте его, разрешите подключение в «Настройки → Конфиденциальность и безопасность → Проводные аксессуары» и переподключите кабель. На Linux при необходимости: `sudo systemctl restart usbmuxd`.
+If the device is not detected, unlock it, allow connections in Settings → Privacy & Security → Wired Accessories, and reconnect the cable. On Linux, if necessary: `sudo systemctl restart usbmuxd`.
 
-## Как запустить
+## Getting started
 
-1. Распакуйте архив целиком в «Загрузки».
-2. Подключите iPhone кабелем, разблокируйте его и нажмите «Доверять». Закройте Finder и iTunes, если в них идёт синхронизация.
-3. Запустите файл для своей ОС:
-   - macOS: `Запуск macOS.command`
-   - Windows: `Запуск Windows.cmd`
-   - Linux: `bash "Запуск Linux.sh"`.
-4. В меню выберите **1** и дождитесь сообщения «Готово».
+1. Extract the entire archive into Downloads.
+2. Connect the iPhone by USB, unlock it and tap Trust. Close Finder and iTunes if they are synchronizing.
+3. Run the launcher for your OS:
+   - macOS: `Launch macOS.command`
+   - Windows: `Launch Windows.cmd`
+   - Linux: `bash "Launch Linux.sh"`.
+4. For T-Mobile Wholesale, choose **14**, leave the SIM slot blank for automatic selection, inspect the read-only preview and type `yes` to install. For the existing Russia/Belarus IMSI workflow, choose **1** instead.
 
-До сообщения «Готово» держите iPhone разблокированным. Если включена резервная копия iCloud, а телефон на зарядке (кабель к компьютеру тоже считается) и экран погас, iOS примерно раз в сутки начинает копию и при этом переписывает служебные файлы Books — прямо посреди этапа ([#44](https://github.com/ios-bundles/CarrierSIM/issues/44)). Скрипт перед этапами предупреждает об этом и показывает, когда была последняя копия.
+Keep the iPhone unlocked until the operation finishes. If iCloud Backup is enabled, the phone is charging (a computer cable counts) and the screen goes dark, iOS starts a backup roughly once a day and rewrites Books support files—even in the middle of a stage ([#44](https://github.com/ios-bundles/CarrierSIM/issues/44)). The script warns before stages and shows the time of the last backup.
 
-При первом запуске скрипт сам скачает нужные библиотеки в папку `.venv`. Это займёт пару минут.
+On first launch, the script downloads its dependencies into `.venv`. This takes a few minutes.
 
-### Без Python: готовая сборка
+### Without Python: standalone builds
 
-К релизу прикладываются архивы `CarrierSIM-vN-macOS-arm64.zip`, `CarrierSIM-vN-macOS-x86_64.zip`, `CarrierSIM-vN-Windows-x64.zip` и `CarrierSIM-vN-Linux-x64.zip`. Python-вариант для всех трёх ОС — `CarrierSIM-vN-Python-universal.zip`. Python и библиотеки уже внутри. Их собирает GitHub Actions (`.github/workflows/standalone.yml`) из того же тега, происхождение подтверждено attestation: `gh attestation verify CarrierSIM-vN-….zip -R ios-bundles/CarrierSIM`.
+Releases include `CarrierSIM-vN-macOS-arm64.zip`, `CarrierSIM-vN-macOS-x86_64.zip`, `CarrierSIM-vN-Windows-x64.zip` and `CarrierSIM-vN-Linux-x64.zip`. The Python version for all three OSes is `CarrierSIM-vN-Python-universal.zip`. Standalone builds include Python and dependencies. GitHub Actions (`.github/workflows/standalone.yml`) builds them from the same tag; verify provenance with `gh attestation verify CarrierSIM-vN-….zip -R ios-bundles/CarrierSIM`.
 
-1. Распакуйте архив целиком. Рядом с `CarrierSIM` (`CarrierSIM.exe`) лежат `bundle.yaml`, `assets.zip` и README. `runs` появится там же.
-2. macOS: сборка не подписана Apple. Один раз снимите карантин со всей папки: `xattr -dr com.apple.quarantine ~/Downloads/CarrierSIM` (путь укажите свой, куда распаковали), потом запустите `CarrierSIM` двойным щелчком. Без этого macOS не даст открыть файл или его библиотеки.
-3. Windows: iTunes x64 по [инструкции на 4PDA](https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362) нужен так же, как и скрипту. Запустите `CarrierSIM.exe`. Если скачивание на 4PDA выдаёт ошибку 404, нужна регистрация, вход в аккаунт и некоторая активность на форуме.
-4. Linux: установите системный `usbmuxd`, распакуйте архив через `unzip` с сохранением символических ссылок и запустите `./CarrierSIM` в терминале. Сборка создаётся и проверяется на Ubuntu 22.04 x64; для более старых систем используйте Python-вариант.
+1. Extract the entire archive. `bundle.yaml`, `assets.zip` and the README are beside `CarrierSIM` (`CarrierSIM.exe`); `runs` is created there too.
+2. macOS: the build is not Apple-signed. Remove quarantine from the extracted folder once: `xattr -dr com.apple.quarantine ~/Downloads/CarrierSIM` (replace the path with yours), then double-click `CarrierSIM`. Otherwise macOS may block the executable or its libraries.
+3. Windows: iTunes x64 is still required; follow the [4PDA instructions](https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362). Run `CarrierSIM.exe`. A 4PDA download returning 404 may require registration, login and some forum activity.
+4. Linux: install system `usbmuxd`, extract with `unzip` to preserve symbolic links, and run `./CarrierSIM` in a terminal. Builds are created and checked on Ubuntu 22.04 x64; use the Python version on older systems.
 
-Меню и флаги те же, что у скрипта: `CarrierSIM --status`, `CarrierSIM --bundle Vodafone_ro --sims 1` и так далее. Сборка для macOS arm64 проверена без телефона (`--check`, меню). Сборки для Windows и Intel Mac на железе не запускались.
+Menus and flags are the same as in the script: `CarrierSIM --status`, `CarrierSIM --bundle Vodafone_ro --sims 1`, and so on. The macOS arm64 build was checked without a phone (`--check`, menu). Windows and Intel Mac builds have not been run on physical hardware.
 
-## Меню
+## Menu
 
-| Пункт  | Что делает                                                                                                          |
-| ------ | ------------------------------------------------------------------------------------------------------------------- |
-| **1**  | Установить профиль по `bundle.yaml` (МТС России — Vodafone_ro, остальные — Vodafone_hu)                             |
-| **2**  | Показать SIM и план установки, ничего не записывая                                                                  |
-| **3**  | Проверить компьютер и файлы, телефон не нужен                                                                       |
-| **4**  | Вернуть штатный профиль (выбранной SIM или всем)                                                                    |
-| **5**  | Восстановить после сбоя                                                                                             |
-| **6**  | Справка по флагам                                                                                                   |
-| **7**  | Выбрать другой профиль и SIM (1, 2 или обе): сначала план и паспорт профиля, запись после подтверждения             |
-| **8**  | Диагностика связи: IMS, VoLTE/VoWiFi/VoNR, ePDG, сеть, 5G SA (только чтение журнала)                                |
-| **9**  | Проверка звонка: канал (Wi-Fi/LTE/5G) и кодек EVS/AMR (только чтение журнала)                                       |
-| **10** | Переключить связь с iPhone: кабель или Wi-Fi (эксперимент). В режиме Wi-Fi все действия с телефоном идут без кабеля |
-| **11** | Отчёт о профиле для темы или issue: журнал CommCenter и что вы проверили сами (только чтение)                       |
+| Item | Action |
+| --- | --- |
+| **1** | Install using `bundle.yaml` (MTS Russia: Vodafone_ro; other eligible SIMs: Vodafone_hu) |
+| **2** | Show SIMs and the installation plan without writing |
+| **3** | Check the computer and files; no phone required |
+| **4** | Restore normal selection for one SIM or all SIMs by removing IMSI links only |
+| **5** | Recover after a failed operation |
+| **6** | Show flag help |
+| **7** | Choose another bundle and SIM (1, 2 or both): show a plan and bundle details before confirmation |
+| **8** | Connection diagnostics: IMS, VoLTE/VoWiFi/VoNR, ePDG, network, 5G SA (log reading only) |
+| **9** | Watch a test call: transport (Wi-Fi/LTE/5G) and EVS/AMR codec (log reading only) |
+| **10** | Switch normal phone operations between USB and experimental Wi-Fi |
+| **11** | Generate a profile report for the forum or an issue: CommCenter log and your manual checks (read-only) |
+| **12** | Experimental GID1 override: preview, then explicit confirmation; USB-only |
+| **13** | Undo a GID1 override using its run directory: preview, then explicit confirmation; USB-only |
+| **14** | Automatically install T-Mobile Wholesale for an eligible SIM; no manual identifiers; USB-only |
+| **15** | Remove an owned ICCID-qualified Wholesale installation; no run-directory input; USB-only |
 
-## Какой профиль ставить: bundle.yaml
+For items **12–15**, the default is **NO**: Enter cancels confirmation. Item **7** keeps its existing blank-answer-means-yes behavior. Items **12–15** refuse Wi-Fi mode; use item **10** to select USB first. Items **14/15** use Enter at the earlier **slot** prompt for automatic selection; an already-installed/no-op preview skips confirmation and writing.
 
-Файл `bundle.yaml` рядом со скриптом задаёт пакет для пункта **1**:
+## Automatic T-Mobile Wholesale: items 14 and 15
+
+**A verified installation is left installed. No daemon, scheduled task or connected computer is needed afterward.** The retained qualified installation worked and survived reboot according to the user. This is persistence on the tested build, not a guarantee against iOS updates, carrier-settings updates, SIM replacement or a full device reset. Remove the owned rule before an iOS/carrier update if you need assured access to the current uninstall mechanism.
+
+Run your OS launcher and choose **14**. Enter selects the sole eligible SIM automatically; enter `1` or `2` to choose a slot explicitly. Inspect the preview, then type `y` or `yes` to install. Unsupported or ambiguous selections stop without writing. Menu **15** previews explicit removal and also defaults to **NO**.
+
+From the updated project folder:
+
+```sh
+# Read-only plan: no trigger, catalog export, Books backup or phone write
+python3 launch.py --tmobile-wholesale --status
+# Install automatically and leave the verified rule applied
+python3 launch.py --tmobile-wholesale
+# Preview and explicitly remove only the owned Wholesale rule
+python3 launch.py --remove-tmobile-wholesale --status
+python3 launch.py --remove-tmobile-wholesale
+```
+
+Use `py` instead of `python3` on Windows. Standalone builds use `CarrierSIM` or `CarrierSIM.exe` instead of `python3 launch.py`. Add `--sims 1` or `--sims 2` if selection is ambiguous. CLI commands without `--status` are write actions, not interactive confirmation prompts. Use a release containing these changes; previously downloaded binaries are not updated by editing the Python source.
+
+The automatic workflow:
+
+- Requires USB and a device-reported `com.apple.TMobile_MVNO_US` profile. Other carriers are not converted. An already reported Wholesale profile is a no-op.
+- Verifies a fresh stock carrier **and operator** baseline, then discovers the actual chosen plain `<PLMN>_GID1-<HEX>` key from CommCenter. This is the matched GID1 key/prefix, **not a raw EF GID1 read**. Missing, composite or ambiguous keys stop safely; `69` is not assumed.
+- Uses that key plus the selected SIM's **full ICCID**, targeting only the unchanged system `TMobile_Wholesale_US.bundle`. Another enabled SIM on the same PLMN is conservatively refused.
+- Backs up the catalog and Books, binds the journal to this phone and SIM identities, reads back the write, verifies Wholesale carrier/operator selections and preserves every other active slot's baseline.
+- After a carrier-switch connection loss following completed write/readback, reconnects to the **same phone**, checks the catalog and identities, and requires one complete fresh rescan. It does not reapply the alias or accept partial logs. Actual rejection or changed evidence still invokes exact owned-entry rollback; undo uses the same reconnect verification after removal.
+
+Re-running installation recognizes a healthy owned installation, including an older manually created qualified journal, and leaves it unchanged. This read-only/no-op path checks recorded verification and the current reported profile; it does **not** perform a fresh catalog export or signature rescan. If an owned installation is interrupted or no longer reported as Wholesale, automatic installation stops rather than overwriting or blindly retrying.
+
+**`--recover` repairs interrupted work; it does not uninstall a healthy installed profile.** Removal is explicit through **15**, `--remove-tmobile-wholesale`, or the printed journal-bound `--undo-gid1` command. The original SIM may be disabled or removed; an unowned rule or stock Wholesale selection is never removed automatically. Item **4** is IMSI-only and is not Wholesale uninstall.
+
+Keep the original **`runs` directory** and all referenced backups when moving/upgrading CarrierSIM; use `--runs PATH` if they are elsewhere. Removal discovers ownership there, not from the displayed carrier name alone. Journals and catalog ZIPs contain the full ICCID even though console/log output masks it: **do not publish these private artifacts**.
+
+
+## Choosing a bundle: bundle.yaml
+
+The `bundle.yaml` file beside the script sets the bundle for menu item **1**:
 
 ```yaml
-# Пакет по умолчанию для SIM России (250) и Беларуси (257)
+# Default bundle for Russian (250) and Belarusian (257) SIMs
 default: Vodafone_hu
-# Пакет для конкретного оператора: MCCMNC без пробела (250 01 = МТС RU)
+# Bundle for a specific carrier: MCCMNC without spaces (250 01 = MTS RU)
 25001: Vodafone_ro
 ```
 
-Для каждой SIM сначала ищется строка с её MCCMNC, затем `default`. Без файла ставится Vodafone_hu. `default` действует только на SIM операторов России (MCC 250) и Беларуси (MCC 257): зарубежная SIM сохраняет свой профиль, в плане (пункт **2**) она помечена «не трогаю». Чтобы сменить профиль зарубежной SIM, добавьте строку с её MCCMNC или выберите её номер в пункте **7** (флаг `--sims 1` или `2`): явно выбранный слот получает профиль при любом операторе. Имя пакета — как папка в `/System/Library/Carrier Bundles/iPhone` на телефоне, без `.bundle`. Пункт **7** и флаг `--bundle` на время запуска заменяют файл.
+For each SIM, an exact MCCMNC entry takes precedence over `default`. Without the file, Vodafone_hu is used. `default` applies only to Russian (MCC 250) and Belarusian (MCC 257) SIMs: foreign SIMs retain their current profile and are marked as untouched in the plan (item **2**). To change a foreign SIM, add its MCCMNC or explicitly select its slot in item **7** (`--sims 1` or `2`); an explicitly selected slot receives the profile regardless of carrier. Use the folder name from `/System/Library/Carrier Bundles/iPhone`, without `.bundle`. Item **7** and `--bundle` override the file for that invocation.
 
-### Паспорт профиля
+### Bundle details
 
-Пункты **1**, **2** и **7** под планом показывают свойства выбранного пакета из таблицы [ios-bundles.github.io](https://ios-bundles.github.io): приоритет VoWiFi дома, VoWiFi в роуминге, подпись сети при звонке по Wi-Fi, номер активации iMessage/FaceTime, значок LTE/4G, переключатель VoLTE, 5G, EVS, доп. услуги через IMS (XCAP) и визуальную голосовую почту. Например, у Vodafone_tr номер активации iMessage местный турецкий, 13191: из российской сети он недоступен, и слетевшая активация по номеру может не восстановиться (так пишут в теме на 4pda). У Vodafone_ro VoWiFi в роуминге выключен.
+Items **1**, **2** and **7** show properties from [ios-bundles.github.io](https://ios-bundles.github.io) beneath the plan: home-network VoWiFi priority, roaming VoWiFi, Wi-Fi Calling network label, iMessage/FaceTime activation number, LTE/4G label, VoLTE switch, 5G, EVS, IMS supplementary services (XCAP) and visual voicemail. For example, Vodafone_tr uses the local Turkish activation number 13191, unreachable from Russia; forum users report that activation by phone number may not recover if it is lost. Vodafone_ro disables roaming VoWiFi.
 
-Это содержимое файлов пакета из iOS 27.0 для iPhone 17, **не проверка на телефоне**: на деле оператор может вести себя иначе. Таблица скачивается раз в неделю в `runs/bundles.json`. Без интернета паспорт просто не показывается. Если имя пакета отличается от таблицы только регистром (`mts_ua` вместо `MTS_ua`), скрипт остановится до записи. Имени, которого нет в таблице, он подскажет похожие и продолжит: в другой iOS пакет может быть.
+These are properties of iOS 27.0 bundle files for iPhone 17, **not a live phone test**: actual carrier behavior may differ. The table is downloaded weekly into `runs/bundles.json`. Without internet, bundle details are omitted. If a name differs only in case (`mts_ua` rather than `MTS_ua`), the script stops before writing. For an unknown name it suggests similar names and continues, because another iOS version may contain that bundle.
 
-## После установки: включить VoWiFi
+## Experimental GID1 override: items 12 and 13
 
-Для полноценной работы профиля рекомендуется перезагрузить телефон после установки. Затем проверьте связь, звонки и интернет.
+**Manual expert workflow; acceptance and service depend on the device/carrier.** For supported T-Mobile MVNO-to-Wholesale installation, prefer [automatic item 14](#automatic-t-mobile-wholesale-items-14-and-15). Manual GID1 changes a user-catalog alias, not Apple system bundles, signatures, the matching algorithm or carrier provisioning. A more specific alias can receive a higher native score; writing it alone does not establish target-board acceptance or service availability.
 
-1. «Настройки → Сотовая связь → нужная SIM» → включите «Вызовы по Wi-Fi».
-2. Включите авиарежим, затем включите Wi-Fi.
-3. Дождитесь, когда рядом с названием оператора появится отметка Wi-Fi.
-4. Выключите авиарежим. Дальше VoWiFi должен подключаться сам.
+A normal installation matches a full IMSI. The experiment instead creates exactly one alias named `<MCCMNC>_GID1-<HEX>` in the user carrier catalog, pointing to an untouched system bundle through the existing bundle-link mechanism. Optional `--gid1-iccid` appends `_ID-<ICCID>` using the selected SIM's full ICCID. MCCMNC is derived from the selected SIM; GID1 is normalized to uppercase, even-length hexadecimal representing **1–16 bytes**. Supply the GID1 from a reliable source; do not guess it.
 
-## Диагностика связи: пункты 8 и 9
+**Selecting `--sims 1` or `2` identifies the SIM used to derive the rule and verify the trial; the slot itself does not isolate the rule.** In plain GID1 mode, other present or future SIMs matching the same MCCMNC and GID1 can be affected. ICCID-qualified mode additionally requires the recorded full ICCID. Apply still conservatively refuses another enabled SIM on the same PLMN. Item **4** removes IMSI links only and **does not remove GID rules**.
 
-Пункт **8** (`--diagnose`) читает журнал CommCenter до 90 секунд: на это время включите и через 10 секунд выключите авиарежим, Wi-Fi не выключайте. По кабелю журнал при этом может оборваться, скрипт подключится снова. Когда после выключения авиарежима все SIM заново зарегистрировались в IMS, скрипт ждёт ещё 10 секунд и заканчивает сам; в терминале закончить раньше можно клавишей Enter. В отчёте по каждой SIM — IMS, VoWiFi, сеть, 5G SA, а отдельным блоком — VoWiFi-туннель: адрес ePDG, последнее состояние IKE и последняя ошибка IKE, если была. Если вместо адреса ePDG стоит `127.0.0.1` или `0.0.0.0`, туннель до оператора не дойдёт ни на каком пакете. Обычно так имя ePDG закрывает DNS — роутер, фильтр рекламы (AdGuard, Pi-hole), VPN или оператор. Полный журнал CommCenter за это время, с подробностями IKE, лежит в `runs/ДАТА-diagnose/commcenter.log` (номера замаскированы).
+### Observed plain-GID1 trial — 2026-10-13
 
-Пункт **9** (`--watch-call`) слушает журнал до 180 секунд, пока вы делаете тестовый звонок, и показывает канал и кодек. После звонка можно нажать Enter.
+On an iPhone 18 Pro (`iPhone19,2`, board `V63AP`) running iOS **27.0.1 (24A446)**, the tool wrote and read back `310240_GID1-69 → TMobile_Wholesale_US.bundle`. CommCenter recognized the user alias, but reported this candidate order:
 
-## Отчёт о профиле: пункт 11
+| Candidate for `310240_GID1-69` | Match score | Preference and result |
+|---|---:|---|
+| System → `TMobile_MVNO_US.bundle` | 70.60 | First; selected for SIM2 |
+| User → `TMobile_Wholesale_US.bundle` | 70.60 | Second; not selected |
 
-Какой профиль лучше для какого оператора, решают отзывы, а не таблица свойств пакета. Пункт **11** (флаг `--report`) собирает их в одном виде:
+SIM1 remained on `Verizon_LTE_US.bundle`. The failed target-selection check triggered automatic scoped undo. The alias was removed, final catalog readback matched the backed-up baseline, both active slots returned verified baseline selections, and all trial transfer journals reported Books restored with no recovery required. The owner journal is `runs/20261013-174048-gid-20a270/gid-alias.json`, with terminal state `rolled_back`.
 
-1. 90 секунд читает журнал CommCenter, как пункт **8**. На это время включите и через 10 секунд выключите авиарежим, Wi-Fi не выключайте.
-2. По каждой SIM спрашивает, что вы проверили руками: звонок по VoWiFi в авиарежиме, включается ли VoWiFi сам, остаётся ли звонок без Wi-Fi в 4G/5G (VoLTE), полосу 5G из `*3001#12345#*`, iMessage с номера, SMS по Wi-Fi, режим модема, объединение вызовов. Отвечайте «д» (да), «н» (нет) или Enter (не проверял). Вопросы задаются только в терминале: если скрипт запущен без него, вопросы пропускаются, а в отчёте появляется строка «Ручные проверки: не заданы».
-3. Печатает блок между «===== Отчёт» и «===== конец отчёта» и сохраняет его в `runs/ДАТА-report/report.txt`.
+The plain-GID1 trial failed to change selection; it did not demonstrate a Wholesale signature failure. Wholesale was not selected in that trial, so its target-board signature acceptance and service/reboot behavior were not tested. The same-key alias is not a working override on this tested device/build.
 
-В отчёте модель, iOS, оператор, загруженный профиль с версией, сводка журнала и ваши ответы. Номера, IMSI и ICCID в нём нет. Блок вставьте в тему или в issue по шаблону «Отчёт о профиле». Телефон не меняется.
 
-## Частые вопросы после установки
+### Observed ICCID-qualified trial — 2026-10-13
 
-**Слетит ли профиль после обновления iOS или перезагрузки?** По отзывам в теме на 4pda не слетает: после обновления 27.0 на 27.0.1 и после перезагрузок профиль остаётся. В iOS 27.2 beta 3 Apple закрыла сам способ записи ([#56](https://github.com/ios-bundles/CarrierSIM/issues/56)): iPhone больше не переносит файлы AirTraffic в каталог операторов. Стоящий профиль после обновления остаётся, но поставить, сменить или удалить его скриптом на такой версии уже нельзя. На 27.2 beta 1 и 2 запись ещё работает. На более новых версиях скрипт предупреждает и всё равно пробует; если iPhone отказывает в переносе, скрипт останавливается до каких-либо изменений и пишет, что Apple закрыла способ. Если профиль ещё придётся менять, не обновляйтесь до 27.2 beta 3 и новее. Снять его там можно полным сбросом iPhone или сменой SIM: профиль привязан к IMSI, и для новой SIM iOS выберет штатный пакет. Сброс настроек сети профиль не снимает.
+On the same device/build, `--gid1-iccid` wrote and read back `310240_GID1-69_ID-<iccid> → TMobile_Wholesale_US.bundle`. The captured CommCenter log reported:
 
-**Поменял SIM, и профиль пропал.** Профиль привязан к IMSI. Новая SIM, перевыпуск eSIM или перенос номера с eSIM на пластиковую SIM дают новый IMSI, поэтому профиль нужно поставить заново пунктом **1** или **7**.
+| Request | Stock MVNO score | Qualified Wholesale score |
+|---|---:|---:|
+| Carrier/operator matching | 70.60 | 80.60 |
+| Carrier lookup | 76.00 | 86.00 |
 
-**После смены SIM не активируются iMessage и FaceTime.** В теме так бывает и на штатном пакете: откат пунктом **4** не помогает. Несколько человек вылечили это перевыпуском SIM или eSIM у оператора: у новой карты другой ICCID, и активация проходила за 10–60 минут. После перевыпуска профиль нужно поставить заново: IMSI тоже новый. Учтите: после перевыпуска SIM/eSIM оператор может ограничить отправку и получение SMS на первые 24 часа. В этот период активация iMessage и FaceTime по номеру может быть временно недоступна. Дождитесь снятия ограничений и повторите активацию.
+Both SIM2 links (`Carrier2Bundle.bundle` and `Operator2Bundle.bundle`) resolved to the untouched system `TMobile_Wholesale_US.bundle`, with `Verification Skipped: No` and `Verification Result: Success`. This is observed selection and signature acceptance on this build, not proof of calls/data, VoWiFi/VoLTE or persistence after reboot. The later lookup included a private GID2 field; it did not expose a usable value for another rule.
 
-**Есть значок 5G, а скорость как в LTE.** Значок и переключатель 5G ещё не значат, что телефон в сети 5G. Наберите `*3001#12345#` и нажмите вызов, откроется Field Test. Полосы с буквой n (n1, n7, n40) относятся к 5G NR, полосы с буквой b к LTE. NSA значит 5G поверх LTE: если рядом видны только b-полосы, телефон работает в LTE. n78 и n79 в России недоступны при любом пакете: разрешённые полосы задаёт подписанный файл GRI в `Default.bundle`, скрипт его не меняет.
+The connection dropped during log capture. Although trigger installation completed, the incomplete capture was correctly refused: the apply did **not** reach `applied_verified`. The first automatic rollback also lost its connection. A USB-reconnected, journal-bound undo recovered the interrupted transfer and finished with a fresh, complete rescan. Its first verification failed, but its scoped recovery succeeded; the command still exited with the original capture error.
 
-**Пропал переключатель VoLTE.** У многих пакетов, в том числе Vodafone_hu, Vodafone_ro и Vodafone_tr, переключателя нет, а VoLTE включён всегда. Проверить просто: выключите Wi-Fi и позвоните. Если сеть во время звонка не падает в 3G и интернет работает, VoLTE работает.
+Final owner state: **`undone`** in `runs/20261013-183644-gid-d8ed8e/gid-alias.json`. The qualified alias was removed, the final catalog readback equaled the pre-trial backup, and both carrier and operator selections returned to `Verizon_LTE_US.bundle` for SIM1 and `TMobile_MVNO_US.bundle` for SIM2. All nine transfer journals reported Books restored, with no active trial recovery remaining. The stock bundle and matching algorithm were not modified. Logs and private recovery artifacts are retained in that run and its recorded recovery directories.
 
-**EVS (HD Voice+) не включается.** EVS бывает только когда он есть у обоих абонентов и оба в IMS: VoLTE, VoNR или VoWiFi. Короткие номера и службы поддержки почти всегда отвечают в AMR, поэтому проверять EVS звонком на 611 или 0890 бесполезно — звоните абоненту того же оператора с EVS. Если EVS есть только на исходящих, а входящие идут в AMR-WB, перезагрузите iPhone: по наблюдению автора скрипта настройки EVS из пакета применяются после полной перезагрузки, авиарежим и переустановка не помогали. Кодек звонка показывает пункт **9**.
 
-**После установки медленнее интернет или не уходят MMS.** Вместе с пакетом меняются настройки сотовых данных: в них может оказаться точка доступа (APN) оператора-донора. Откройте «Настройки → Сотовая связь → [номер] → Сотовая сеть передачи данных» и, если там чужой APN, впишите APN и настройки MMS своего оператора с его сайта; затем включите и выключите авиарежим. Если пункта нет или APN уже свой, дело, скорее всего, в покрытии: в теме у одних на том же пакете скорость упала, у других нет, и сравнение в разных местах Москвы показало зависимость от вышек.
+### Retained service trial — 2026-10-13
 
-**VoWiFi включается только в авиарежиме или при слабом сигнале.** Когда звонить через Wi-Fi, а когда через сотовую сеть, решают пакет и оператор. У части пакетов в домашней сети приоритет у сотовой связи. Сравнить пакеты по этому признаку можно на [ios-bundles.github.io](https://ios-bundles.github.io).
+An explicitly requested service trial left the same qualified Wholesale rule installed on SIM2. Unified logging avoided legacy replay, but the first carrier switch still closed the device session. The default failure handler removed the catalog rule before its Books cleanup lost the connection; Wholesale remained cached as active. Fresh-session recovery repaired only the consumed transfer's Books cleanup, and a catalog snapshot proved the rule was absent before its exact owned entry was restored.
 
-**В строке оператора «Vodafone TR Wi-Fi» или «4G» вместо «LTE».** Название сети при звонке через Wi-Fi и значок задаёт пакет. На связь это не влияет, а поменять их, не меняя пакет, нельзя: пакеты подписаны Apple.
+The retained installation then passed catalog readback, stable SIM identity checks and a fresh, complete rescan: **both carrier and operator selected `TMobile_Wholesale_US.bundle` for SIM2**, with successful signature verification. SIM1 remained on verified `Verizon_LTE_US.bundle` selections. The phone reported Wholesale version **72.0**. Books cleanup was verified and no transfer recovery remained pending. The user subsequently reported that it works and persists through reboot; no individual unreported service checks are inferred.
 
-**Предлагают «Обновить настройки оператора».** В теме один человек нажал «Обновить», и профиль слетел наполовину: 5G пропал. Ставил он версией v3. У другого с Vodafone_tr это предложение приходит каждый день, у третьего с тем же пакетом не приходит ни разу. Проверенных данных пока нет, поэтому обновление лучше не принимать. Если профиль всё же слетел, поставьте его заново пунктом **1** или **7** и опишите случай в [issue #16](https://github.com/ios-bundles/CarrierSIM/issues/16).
+The owner is `runs/20261013-190456-gid-1fa4b6/gid-alias.json`, **`applied_verified`**, with verification evidence in `runs/20261013-191437-gid-retain-37f2b3/retained-rescan`. No undo was run after the retained installation. The implementation now reconnects and verifies in place after a qualifying connection loss, before deciding whether scoped rollback is necessary. Generic `--recover` leaves healthy installed journals alone.
 
-**МегаФон: SMS через VoWiFi.** Звонки через Wi-Fi работают, SMS — не у всех. До 02.10.2026 в теме SMS через VoWiFi на МегаФоне не уходили ни у кого. 02.10 у двух человек с Vodafone_hu SMS в авиарежиме ушли, у третьего с тем же пакетом нет. Проверять лучше на обычном номере: SMS на короткие номера через VoWiFi не уходят и на штатном пакете. На Билайне SMS через VoWiFi ходят.
+On the tested Mac, from the repository directory, undo **only when explicitly wanted**:
 
-**Билайн: переключатель «Вызовы по Wi-Fi» есть, а VoWiFi не работает.** Сперва проверьте, что услуга подключена на номере. По отзывам в теме Билайн выключает её у SIM, которая стояла в телефоне без официальной поддержки VoWiFi. Помогает одно из двух. Позвонить в поддержку и попросить включить VoWiFi на номере (бывает, что отказывают). Или вставить SIM в Android либо в iPhone 13 и старее, включить там VoWiFi и вернуть SIM в iPhone.
+```sh
+.venv/bin/python3.12 carrier.py --undo-gid1 "runs/20261013-190456-gid-1fa4b6"
+```
 
-**T2 и VoWiFi.** До 01.10.2026 у T2 VoWiFi на iPhone в теме не работал ни на одном пакете, кроме Nova_is с подменой адреса ePDG в своём DNS, да и так вышло не у всех. В ночь на 02.10 VoWiFi включился сам, без DNS и без переустановки, у многих в разных городах: Москва, Санкт-Петербург, Нижний Новгород, Волгоград, Омск, Брянск, Калужская область. Пакеты — Vodafone_hu, MTS_ua, Telia_az. Из Перми и части Москвы пишут, что пока нет, и смена пакета не помогла. Похоже, T2 включает услугу на своей стороне по регионам: если не работает, подождите и время от времени включайте и выключайте авиарежим. Ещё в теме приводят условие с сайта T2: VoWiFi не работает вместе с услугами «Городской номер», «Второй номер», «Корпоративная АТС», CVPN и CSD. Если одна из них подключена, пакет не поможет.
 
-## Как это работает
+### Plan, apply, test, undo
 
-Профиль оператора для SIM выбирает процесс CommCenter. Пакеты лежат в двух местах:
+Use USB for the entire experiment. Keep the phone unlocked and preserve its run directory.
 
-- `/System/Library/Carrier Bundles/iPhone/*.bundle` — системные пакеты, подписаны Apple, раздел только для чтения;
-- `/var/mobile/Library/Carrier Bundles/iPhone` — пользовательский каталог: обновления пакетов (IPCC) и симлинки, по которым CommCenter находит пакет для SIM.
+```sh
+# Read-only plan; explicit bundle and exactly one slot are mandatory
+python3 carrier.py --gid1 HEX --bundle NAME --sims 1 --status
+# Apply once (replace HEX and NAME with your actual values)
+python3 carrier.py --gid1 HEX --bundle NAME --sims 1
+# Read-only undo preview for the exact apply run
+python3 carrier.py --undo-gid1 "runs/RUN_DIRECTORY" --status
+# Remove the owned alias and verify undo
+python3 carrier.py --undo-gid1 "runs/RUN_DIRECTORY"
+```
 
-Скрипт меняет только пользовательский каталог.
+Use `--sims 2` for slot 2. On Windows, replace `python3` with `py`; standalone builds use `CarrierSIM` or `CarrierSIM.exe` instead of `python3 carrier.py`. Alternatively, choose item **12**, inspect its preview and type `y` or `yes` to apply; use item **13** with the literal saved run directory to undo. Empty inputs and Enter at either confirmation cancel. If item **10** currently selects Wi-Fi, items **12** and **13** refuse before collecting input: switch item **10** to USB first. CLI apply/undo commands themselves are write actions; adding `--status` makes them read-only planning.
 
-Компьютер общается с iPhone по USB или, в режиме Wi-Fi, по локальной сети через службы, которые телефон открывает после «Доверять». Скрипт использует пять из них:
+The manual and automatic GID/T-Mobile action flags are mutually exclusive and cannot be combined with other write, recovery, diagnostic or check actions. `--status` is allowed. Do not add `--wifi`; apply and undo are USB-only, even when the launcher previously selected Wi-Fi. There is **no automatic multi-apply retry**.
 
-- **AFC** (Apple File Conduit, `com.apple.afc`) — доступ к файлам телефона, но только внутри `/var/mobile/Media`. Этой службой пользуются приложения для импорта фото и файловые менеджеры для iPhone. К `/var/mobile/Library` и `/System` она доступа не даёт.
-- **`installation_proxy`** — установка приложений и пакетов оператора IPCC.
-- **`syslog_relay`** — системный журнал телефона, из него читаются сообщения CommCenter.
-- **`streaming_zip_conduit`** — загрузка ZIP-архива с распаковкой в `/var/mobile/Media`.
-- **AirTraffic** (`com.apple.atc`) — синхронизация медиатеки iTunes/Finder.
+#### ICCID-qualified trial (CLI)
 
-Первые четыре скрипт вызывает через библиотеку `pymobiledevice3`, AirTraffic — через библиотеку Apple (см. ниже).
+Add `--gid1-iccid` to the plan and apply commands:
 
-Шаги:
+```sh
+python3 carrier.py --gid1 HEX --gid1-iccid --bundle NAME --sims 2 --status
+python3 carrier.py --gid1 HEX --gid1-iccid --bundle NAME --sims 2
+```
 
-1. **Триггер.** Через `installation_proxy` ставит подписанный IPCC другого оператора (`AVEA_tr`, `Swisscom_ch` или `O2_Germany` — тот, что не совпадает с вашими SIM). Установка IPCC заставляет CommCenter заново выбрать пакеты. Если каталога на телефоне ещё нет, она его создаёт. Пакет триггера остаётся в каталоге, но к вашим SIM не относится.
-2. **Копия.** Забирает каталог в `/var/mobile/Media`, читает его по AFC и сохраняет в `runs/…/original.zip`.
-3. **Запись.** Добавляет в корень каталога симлинки с именем из 15 цифр IMSI каждой выбранной SIM на `/System/Library/Carrier Bundles/iPhone/Vodafone_hu.bundle` (или на пакет, выбранный в пункте 7). Остальное содержимое каталога не меняется.
-4. **Проверка.** Читает записанный каталог обратно и сравнивает с планом. Затем снова ставит триггер и по журналу CommCenter (`Resolved path`, `Verification Result`) проверяет, какой пакет выбран для каждой SIM и принята ли его подпись. Если в пункте 7 выбранный пакет не выбран ни для одной SIM (такого пакета нет в этой iOS), каталог возвращается из копии.
+The qualifier uses the full ICCID reported for the selected SIM, not guessed bytes or another SIM's identifiers. This narrows the rule to that ICCID; it does **not** promise a higher matching score or target acceptance. A fresh baseline must still choose the plain `<MCCMNC>_GID1-<HEX>` key. The qualified trial requires successful, consistent **carrier and operator** selections for every enabled slot: both target selections must resolve to the requested system bundle, and other slots must remain at their corresponding baselines. Undo verifies both layers for unchanged original SIM identities.
 
-Каталог лежит вне `/var/mobile/Media`, поэтому через AFC записать его нельзя. Перенос сделан по методу AirLift: архив с деревом каталога загружается в `Media` через `streaming_zip_conduit`, а затем служба синхронизации AirTraffic (протокол iTunes) в ходе поддельной синхронизации книг перемещает его на место по относительному пути. Служебные файлы, которые AirTraffic оставляет в `/var/mobile/Media/Books`, скрипт удаляет, а исходное состояние `Books` сверяет с копией. На macOS и Windows используется библиотека Apple `AirTrafficHost`; на Linux обмен с `com.apple.atc` реализован через `pymobiledevice3` на основе протокола [AirCard-Linux](https://github.com/shinkuan/AirCard-Linux) и [его варианта](https://github.com/hoicau/AirCard-Linux).
+`--gid1-iccid` requires `--gid1`; do not pass it to undo. The saved journal determines the qualifier and validates its ICCID against the original selected-SIM hash, including when that SIM is removed. Menu **12** remains plain GID1; menu **13** can undo either form using its exact run directory. CLI output and CommCenter logs mask the ICCID, but the exact alias name in the recovery journal and catalog archives contains it. **Keep these artifacts private.**
 
-На Linux команда `bash "Запуск Linux.sh" --atc-probe` проверяет начало сеанса AirTraffic без передачи файлов. Полная установка по USB проверена на iPhone 14, 14 Pro, 15 Pro, 15 Pro Max, 17 и 17 Pro с iOS 18.7.7 и 26.x. На iPhone 14 Pro проверены возврат штатных профилей двух SIM и последующая установка только для SIM 1. На iPhone 15 Pro / iOS 27.0.1 (24A446), МТС, по USB проверены восстановление после сбоя (пункт 5) и последующий возврат штатного профиля (пункт 4): статус подтвердил MTS_ru, служебные файлы Books восстановлены. Wi-Fi на Linux отдельно не проверен.
 
-Проверенные сочетания при установке по USB:
+The read-only preview does not install a trigger, export the catalog or create a Books backup. It is not proof that an alias is absent or a bundle will be accepted: those checks occur during the confirmed write operation.
 
-| iPhone     | iOS (сборка)     | SIM → пакет             |
-| ---------- | ---------------- | ----------------------- |
-| 14         | 26.3 (23D127)    | МТС → Vodafone_ro       |
-| 14 Pro     | 26.3.1 (23D8133) | Yota и T2 → Vodafone_hu |
-| 15 Pro     | 18.7.7 (22H340)  | Билайн → Vodafone_hu    |
-| 15 Pro Max | 26.6.1 (23G83)   | Билайн → Vodafone_hu    |
-| 17         | 26.6.1 (23G83)   | МТС → Vodafone_ro       |
-| 17 Pro     | 26.6.2 (23G90)   | МТС eSIM → Vodafone_ro  |
+Before committing the alias, the experiment requires a fresh carrier-catalog and Books backup, device/family binding, stable hashed IMSI and ICCID bindings for the selected SIM and all other enabled SIMs, an absent alias, exact symlink bytes, saved baseline slot selections, backup hashes and durable lifecycle state in `gid-alias.json`. A fresh baseline rescan must show that the selected SIM chose the **exact `<MCCMNC>_GID1-<HEX>` matching key**, with verified baseline selections; a resolved bundle name or selection score alone is not enough. Identities are rechecked before writing. Existing aliases, unsupported families, known-closed AirLift builds, missing or unstable identifiers, and missing selection evidence cause a safe stop—not a guessed fallback. Rescan requires an independent, non-overlapping, device-board-signed trigger. Successful trigger installation alone does not prove target-bundle acceptance.
 
-На iPhone 17 также подтверждён звонок по VoWiFi. Эти проверки выполнены на Linux.
+Trigger rescans capture the live unified CommCenter stream, the same logging service used by diagnostics. Historical entries are disabled, collection starts after fresh CommCenter activity is observed, and identifiers are masked before disk. This avoids the legacy relay's buffered-line replay without accepting old selections as fresh proof. A dropped stream invalidates that capture. After completed catalog write/readback, an actual connection loss permits a same-device reconnect, catalog/identity checks and one fresh verification-only rescan; partial logs alone are never success.
 
-Вызовы Apple и обмен AirTraffic вынесены в `airtraffic_apple.py`. Модуль работает в отдельном процессе; `carrier.py` ведёт журнал и подтверждает резервную копию перед финальным переносом. При импорте модуль не загружает библиотеки Apple.
+Selection is proved only by a target `Resolved path`, the correct slot link and successful verification; other enabled slots must remain at their baseline selections. Rejection, unverified selection or missing logs cause automatic **scoped undo**: remove only the exact owned alias from the current catalog, preserve unrelated changes, rescan, and verify rollback. Missing catalog, Books or recovery verification must not be reported as completed rollback.
 
-Пункт **4** удаляет из корня каталога все симлинки с именем из 15 цифр. Остальное содержимое каталога, включая симлинки по MCCMNC и пакеты IPCC, не трогается.
+A successful apply **remains installed** for normal use and service/reboot checks. Record the run directory and the exact undo command printed by the tool. Test the calls, data, VoWiFi/VoLTE and other services you rely on; profile selection does not prove them. Undo is explicit, not an immediate post-install step. **Remove the rule before an iOS/carrier-settings update if you need guaranteed access to today's removal mechanism.** A future update can replace the rule or close that write path.
 
-## Если что-то пошло не так
+Undo uses the operation's saved `gid-alias.json`, device binding and exact owned-entry checks. It remains possible if the original SIM is disabled or removed. A changed alias is refused; an already absent alias is an idempotent undo only with verification. Exceptions, disconnections, interrupts and process-crash journals preserve recovery state: reconnect by USB and use the recorded undo/recovery instructions, without blindly applying again. Item **5** (`--recover`) performs bound undo for **interrupted** GID journals, never another apply, while leaving healthy `applied_verified` installations installed. Existing stage recovery remains available for interrupted transfers or Books cleanup. Remove a healthy installation explicitly through item **13**, item **15** for owned qualified Wholesale, or the printed `--undo-gid1` command.
 
-- **«Прошлая операция не завершилась».** Выберите пункт **5**, затем повторите нужный пункт.
-- **Вернуть штатный выбор пакетов.** Пункт **4** удаляет IMSI-симлинки, добавленные скриптом.
-- **«Журнал iPhone оборвался» в пунктах 8 и 9.** При включении авиарежима iPhone может закрыть поток журнала. Скрипт переподключается и дочитывает до конца отведённого времени, а в конце пишет, сколько было переподключений. Если журнал не возвращается больше 20 секунд (по Wi-Fi авиарежим может оборвать всю связь), отчёт собирается по тому, что пришло до обрыва; если журнала не было совсем (например, выдернут кабель), сбор останавливается с ошибкой.
-- **«Выбор не подтверждён» (код выхода 3).** По каждой SIM скрипт пишет, что выбрала iOS: «iOS выбрала X вместо Y» (если iOS выбрала другой пакет, скрипт сам возвращает прежние настройки), «подпись не принята» или «нет выбора пакета для этой SIM». Если iOS в журнале выбирала пакеты, но не этот, скрипт возвращает прежние настройки. Если журнал пересканирования пустой, каталог остаётся записанным: включите авиарежим на 15 секунд и посмотрите пунктом **2** строку «сейчас».
-- **Папка `runs`** хранит копии каталога и журналы операций. Пока установка идёт, не удаляйте её. Переносить её в новую версию не нужно: остатки прошлых запусков скрипт убирает с телефона сам. Не публикуйте её: в журналах есть идентификаторы SIM и телефона. Стандартная `runs` уже исключена в `.gitignore`. Если указываете свою папку через `--runs` внутри клона репозитория, исключите её сами, лучше в `.git/info/exclude`: например, для `--runs wifi-runs` добавьте строку `/wifi-runs/`. Скрипт правила git не меняет.
-- **Версия CarrierSIM** указана в меню, начале `session.log`, `environment.json` и блоке диагностики. Суффикс `-dev` означает версию в разработке. «Сборка скрипта» — первые 12 символов SHA256 файла `carrier.py`, позволяющие различать изменения внутри одной версии. Без подключения телефона версию можно посмотреть командой `python carrier.py --version`.
+Undo reports the SIMs present at final verification, not an earlier preview. With no active SIMs, it verifies the catalog and Books restoration but explicitly reports slot selection as untested; enable a SIM before checking its selection or service. A crash before any device-change intent can be cancelled without a trigger. Once a final transfer was authorized, an unconsumed final source remains ambiguous: recovery stops rather than blindly replacing the catalog. Stage repair also refuses to overwrite a different current catalog. An identical alias created by another operation before our final transfer was authorized is not owned and is preserved.
 
-**macOS пишет «Запуск macOS.command повреждено… Переместите в Корзину».** Файл не повреждён: macOS так блокирует неподписанные файлы, скачанные из интернета или Telegram.
+`--restore-backup "runs/RUN_DIRECTORY"` is a fallback that restores the **entire saved catalog**, not a scoped alias removal. It can overwrite unrelated catalog changes made after the backup. Preserve backups and journals until verified undo and recovery are complete. Do not publish them; catalog archives can contain SIM identifiers even when the experiment's identity record stores hashes.
 
-1. Нажмите **«Отменить»**.
-2. Откройте «Терминал», напечатайте `bash ` с пробелом в конце, перетащите в окно файл `Запуск macOS.command` и нажмите Enter.
+### Inspecting a retained eSIM trial
 
-Можно один раз снять метку карантина с папки, и дальше двойной щелчок будет работать:
+1. Open **Settings → General → About**, scroll to the relevant eSIM section, and inspect **Carrier** and its version. The displayed carrier name/version need not visibly change; About alone does not identify the selected bundle.
+2. Open **Settings → Cellular / Mobile Service → the trial eSIM**. Inspect **Voice & Data** and **Wi-Fi Calling** and note which options are available. Dismiss any carrier-settings update prompt while the experiment is installed.
+
+For service checks, explicitly select that eSIM for cellular data and outgoing calls. Turn off Wi-Fi for the cellular-data check and prevent automatic data switching to another SIM from hiding a failure. For Wi-Fi Calling, use the Airplane Mode/Wi-Fi procedure below and make an actual call; a carrier label alone does not prove service. Preserve the apply run and its exact undo command. A successful apply is left installed until you explicitly undo it.
+
+
+## After installation: enable VoWiFi
+
+For the normal IMSI profile, a reboot after installation is recommended so the profile takes full effect. Then check connectivity, calls and data. For automatic Wholesale, use the workflow and persistence caveats above; manual GID1 users should perform their own service checks and undo explicitly when wanted.
+
+1. Settings → Cellular → the relevant SIM → enable Wi-Fi Calling.
+2. Enable Airplane Mode, then enable Wi-Fi.
+3. Wait for the Wi-Fi indication beside the carrier name.
+4. Disable Airplane Mode. VoWiFi should then connect automatically if the network and carrier allow it.
+
+## Connection diagnostics: items 8 and 9
+
+Item **8** (`--diagnose`) reads CommCenter logs for up to 90 seconds. Enable Airplane Mode, disable it after 10 seconds and leave Wi-Fi enabled. The USB log stream may disconnect; the script reconnects. Once all SIMs re-register with IMS after Airplane Mode is disabled, it waits another 10 seconds and finishes. Press Enter in a terminal to finish earlier. The report shows IMS, VoWiFi, network and 5G SA per SIM, plus the VoWiFi tunnel's ePDG address, latest IKE state and latest IKE error, if any. An ePDG address of `127.0.0.1` or `0.0.0.0` cannot reach the carrier with any bundle. DNS blocking by a router, ad blocker (AdGuard, Pi-hole), VPN or carrier is a common cause. Full CommCenter logs, including IKE details, are saved in `runs/DATE-diagnose/commcenter.log` with numbers masked.
+
+Item **9** (`--watch-call`) listens for up to 180 seconds while you make a test call and shows its transport and codec. Press Enter after the call to finish.
+
+## Profile report: item 11
+
+User reports, rather than bundle-property tables, establish which profiles work best for a carrier. Item **11** (`--report`) collects them in a common format:
+
+1. Read CommCenter logs for 90 seconds, as in item **8**. Enable Airplane Mode, disable it after 10 seconds and leave Wi-Fi enabled.
+2. For each SIM, answer which checks you performed: VoWiFi calls in Airplane Mode, automatic VoWiFi activation, staying on 4G/5G during calls without Wi-Fi (VoLTE), the 5G band from `*3001#12345#*`, iMessage by phone number, SMS over Wi-Fi, tethering and merging calls. Answer `y` (yes), `n` (no) or Enter (not tested). Questions are terminal-only; without a terminal they are skipped and the report notes that manual checks were not supplied.
+3. Print the block between `===== Profile report` and `===== End of report` and save it in `runs/DATE-report/report.txt`.
+
+The report includes model, iOS, carrier, loaded profile and version, log summary and your answers. Phone numbers, IMSI and ICCID are not included. Paste the block into the forum or the **Profile report** issue template. The phone is not modified.
+
+## Frequently asked questions after installation
+
+**Will a profile survive an iOS update or reboot?** The qualified Wholesale user reported a working installation that survives reboot; this does not establish survival across future iOS/carrier updates. Forum users separately report that ordinary IMSI profiles survived updates from 27.0 to 27.0.1 and reboots. In iOS 27.2 beta 3, Apple closed the write mechanism ([#56](https://github.com/ios-bundles/CarrierSIM/issues/56)): AirTraffic no longer moves files into the carrier catalog. An existing profile can remain after an update, but the script cannot install, change or remove it on that version. Writing still works on 27.2 beta 1 and 2. The normal IMSI workflow warns on newer versions and attempts the transfer; refusal stops it before changes. If you will need to change a profile, do not update to a known-closed build. Ordinary IMSI bindings can stop matching after SIM replacement, or be removed by a full iPhone reset; Reset Network Settings does not remove them. **Remove an owned GID/Wholesale rule before an iOS/carrier update if you need assured access to its current removal path.**
+
+**I changed SIMs and the profile disappeared.** Ordinary profiles are bound to IMSI. A new SIM, reissued eSIM or number transfer from eSIM to physical SIM produces a new IMSI; install again with item **1** or **7**.
+
+**iMessage and FaceTime do not activate after changing SIMs.** Forum users also see this with the normal bundle; item **4** does not resolve it. Several users fixed it by getting a replacement SIM/eSIM: the new ICCID activated in 10–60 minutes. Install the profile again afterward because IMSI also changes. A carrier may restrict incoming and outgoing SMS for the first 24 hours after replacement; phone-number activation may be unavailable until those restrictions expire. Wait and retry activation.
+
+**There is a 5G icon, but speed is like LTE.** The icon and switch do not prove a 5G connection. Dial `*3001#12345#` to open Field Test. Bands beginning with n (n1, n7, n40) are 5G NR; bands beginning with b are LTE. NSA is 5G over LTE: if only b-bands appear, the phone is using LTE. n78 and n79 are unavailable in Russia with any bundle: the signed GRI file in `Default.bundle` sets allowed bands and is not modified by the script.
+
+**The VoLTE switch disappeared.** Many bundles, including Vodafone_hu, Vodafone_ro and Vodafone_tr, omit the switch and leave VoLTE always enabled. Turn off Wi-Fi and make a call: if the network does not fall back to 3G and data still works during the call, VoLTE works.
+
+**EVS (HD Voice+) does not activate.** Both parties must support EVS and use IMS (VoLTE, VoNR or VoWiFi). Short codes and support lines almost always use AMR, so calls to 611 or 0890 are not useful EVS tests; call an EVS-capable subscriber on the same carrier. If outgoing calls use EVS but incoming calls use AMR-WB, reboot: the author's observation was that bundle EVS settings applied only after a full reboot, not Airplane Mode or reinstallation. Item **9** shows the codec.
+
+**Data is slower or MMS no longer sends after installation.** The bundle also changes cellular-data settings and may supply the donor carrier's APN. Open Settings → Cellular → [line] → Cellular Data Network. If the APN is foreign, enter your own carrier's APN and MMS settings from its website, then toggle Airplane Mode. If the menu is absent or the APN is already correct, coverage is more likely: some forum users saw slower speeds with the same bundle while others did not, and comparisons around Moscow varied by cell site.
+
+**VoWiFi works only in Airplane Mode or with a weak signal.** The bundle and carrier decide when to use Wi-Fi rather than cellular service. Some bundles prefer cellular on the home network. Compare them at [ios-bundles.github.io](https://ios-bundles.github.io).
+
+**The carrier line says “Vodafone TR Wi-Fi” or “4G” instead of “LTE”.** The bundle sets the Wi-Fi Calling label and network icon. This does not affect connectivity, and they cannot be changed without changing bundles because bundles are Apple-signed.
+
+**The phone offers a carrier settings update.** One forum user accepted an update and partially lost the profile: 5G disappeared after installing with v3. Another user with Vodafone_tr receives the offer daily; a third with the same bundle never receives it. There is not enough verified evidence, so declining is safer. If an ordinary IMSI profile is lost, reinstall with item **1** or **7** and report the case in [issue #16](https://github.com/ios-bundles/CarrierSIM/issues/16). Undo a GID1 trial before any such update.
+
+**MegaFon: SMS over VoWiFi.** Wi-Fi calls work, but SMS does not work for everyone. Before October 2, 2026, no forum user reported successful MegaFon SMS over VoWiFi. On October 2, two Vodafone_hu users sent SMS in Airplane Mode; a third using the same bundle could not. Test a normal phone number: even the normal bundle does not send short-code SMS over VoWiFi. Beeline users report SMS over VoWiFi working.
+
+**Beeline: the Wi-Fi Calling switch exists, but VoWiFi does not work.** First check that the service is enabled on your number. Forum users report that Beeline disables it for a SIM used in a phone without official VoWiFi support. Either ask support to re-enable it (they sometimes refuse), or put the SIM in an Android phone or iPhone 13 or earlier, enable VoWiFi there, then return it to the iPhone.
+
+**T2 and VoWiFi.** Before October 1, 2026, forum users could not make T2 VoWiFi work on iPhone with any bundle except Nova_is plus an ePDG override in their DNS, and even that did not work for everyone. Overnight on October 2, it began working automatically, without DNS changes or reinstallation, in Moscow, Saint Petersburg, Nizhny Novgorod, Volgograd, Omsk, Bryansk and Kaluga Region, using Vodafone_hu, MTS_ua and Telia_az. Users in Perm and parts of Moscow still reported failure; changing bundles did not help. T2 appears to be enabling the service region by region: wait and occasionally toggle Airplane Mode. The forum also cites T2's website: VoWiFi is incompatible with “City number”, “Second number”, “Corporate PBX”, CVPN and CSD. A bundle change will not fix those service conflicts.
+
+## How it works
+
+CommCenter selects the carrier bundle for a SIM. Bundles reside in two places:
+
+- `/System/Library/Carrier Bundles/iPhone/*.bundle`: Apple-signed system bundles on a read-only partition;
+- `/var/mobile/Library/Carrier Bundles/iPhone`: the user catalog, containing carrier updates (IPCC) and symlinks used by CommCenter to find a SIM's bundle.
+
+The script changes only the user catalog. For iPad, the family-specific catalog and system bundle paths are used.
+
+The computer connects by USB, or by local network in Wi-Fi mode, to services made available after Trust:
+
+- **AFC** (Apple File Conduit, `com.apple.afc`): file access within `/var/mobile/Media` only. Photo import applications and iPhone file managers use it; it cannot access `/var/mobile/Library` or `/System`.
+- **`installation_proxy`**: installs applications and carrier IPCC packages.
+- **`syslog_relay` / unified OS trace**: diagnostic logs and fresh structured CommCenter evidence; GID rescans use unified logging with historical entries disabled.
+- **`streaming_zip_conduit`**: uploads and extracts a ZIP into `/var/mobile/Media`.
+- **AirTraffic** (`com.apple.atc`): iTunes/Finder media synchronization.
+
+The first four use `pymobiledevice3`; AirTraffic uses the Apple library on macOS and Windows, and the native backend on Linux.
+
+Normal IMSI installation steps:
+
+1. **Trigger.** Install another carrier's signed IPCC through `installation_proxy` (`AVEA_tr`, `Swisscom_ch` or `O2_Germany`, chosen not to overlap your SIMs). IPCC installation forces CommCenter to reselect bundles and creates the user catalog if needed. The trigger bundle remains there but does not match your SIMs.
+2. **Backup.** Move the catalog into `/var/mobile/Media`, read it over AFC and save `original.zip` in the run directory.
+3. **Write.** Add root-level symlinks named with each selected SIM's 15-digit IMSI, pointing to `/System/Library/Carrier Bundles/iPhone/Vodafone_hu.bundle` or the bundle selected in item **7**. The rest of the catalog is unchanged.
+4. **Verify.** Read the catalog back and compare it with the plan. Install the trigger again and inspect CommCenter's `Resolved path` and `Verification Result` for each SIM's selected bundle and accepted signature. If the bundle chosen in item **7** is not selected for any SIM (for example, it does not exist in that iOS), restore the catalog backup.
+
+AFC cannot write the catalog because it is outside `/var/mobile/Media`. The AirLift method uploads an archive into Media through `streaming_zip_conduit`; AirTraffic then moves it into place using a relative path during a synthetic Books sync. The script removes AirTraffic's support files in `/var/mobile/Media/Books` and compares Books with its backup. macOS and Windows use Apple's `AirTrafficHost` library. Linux implements `com.apple.atc` through `pymobiledevice3`, based on [AirCard-Linux](https://github.com/shinkuan/AirCard-Linux) and [its variant](https://github.com/hoicau/AirCard-Linux).
+
+On Linux, `bash "Launch Linux.sh" --atc-probe` checks AirTraffic session startup without transferring files. Full USB installation has been tested on iPhone 14, 14 Pro, 15 Pro, 15 Pro Max, 17 and 17 Pro with iOS 18.7.7 and 26.x. Restoring both SIMs' normal profiles and then installing only for SIM 1 was tested on iPhone 14 Pro. On iPhone 15 Pro / iOS 27.0.1 (24A446), MTS, USB recovery (item **5**) followed by normal-profile restoration (item **4**) was tested: status confirmed MTS_ru and Books support files were restored. Linux Wi-Fi has not been separately tested.
+
+Verified USB installation combinations:
+
+| iPhone | iOS (build) | SIM → bundle |
+| --- | --- | --- |
+| 14 | 26.3 (23D127) | MTS → Vodafone_ro |
+| 14 Pro | 26.3.1 (23D8133) | Yota and T2 → Vodafone_hu |
+| 15 Pro | 18.7.7 (22H340) | Beeline → Vodafone_hu |
+| 15 Pro Max | 26.6.1 (23G83) | Beeline → Vodafone_hu |
+| 17 | 26.6.1 (23G83) | MTS → Vodafone_ro |
+| 17 Pro | 26.6.2 (23G90) | MTS eSIM → Vodafone_ro |
+
+A VoWiFi call was also confirmed on iPhone 17. These tests were performed on Linux and concern the existing IMSI workflow, not the GID1 experiment.
+
+Apple calls and AirTraffic exchange are isolated in `airtraffic_apple.py`, running in a separate process. `carrier.py` records logs and confirms the backup before the final transfer. Importing the module does not load Apple libraries.
+
+Item **4** removes root-level 15-digit IMSI symlinks (or the selected SIM's link). Other entries, including MCCMNC links, GID1 aliases and IPCC packages, are left intact.
+
+## If something goes wrong
+
+- **Previous operation unfinished:** use item **5**, then repeat the intended normal action. For an experimental alias, preserve the run directory and follow its undo/recovery instructions; do not blindly apply again.
+- **Restore normal bundle selection:** item **4** removes IMSI links added by the script. Use item **13** for GID1 aliases.
+- **Log disconnected in items 8 or 9:** Airplane Mode can close the stream. The script reconnects and continues until the time limit, then reports the reconnect count. If logs do not return for more than 20 seconds (Wi-Fi Airplane Mode can break the entire connection), the report uses the data collected so far. If no log data arrived at all, such as after cable removal, collection fails.
+- **Selection not confirmed (exit code 3), normal IMSI workflow:** each SIM is reported as having a different bundle selected, a rejected signature or no bundle selection. If iOS selected another bundle, the script restores the previous settings. If the rescan log is empty, the normal workflow leaves the written catalog in place: enable Airplane Mode for 15 seconds and check the current-bundle line in item **2**. **The GID1 experiment differs: missing/unverified selection triggers scoped undo, not leaving an unproved alias installed.**
+- **`runs` folder:** contains catalog backups and operation logs. Do not delete it during installation or before verified GID1 undo/recovery. Ordinary completed-run leftovers do not need migrating to a new version; the script cleans its own device leftovers. Preserve active GID/Wholesale owner journals and referenced backups when upgrading the software; use `--runs PATH` to keep access to their original location. Before updating iOS/carrier settings, use explicit removal if you need the current write path. Do not publish `runs`: backups and qualified journals contain SIM/device identifiers. Default `runs` is excluded in `.gitignore`. If `--runs` uses another directory inside a clone, exclude it yourself, preferably in `.git/info/exclude` (for example `/wifi-runs/` for `--runs wifi-runs`). The script does not alter git rules.
+- **CarrierSIM version:** appears in the menu, at the start of `session.log`, in `environment.json` and in diagnostics. `-dev` denotes a development version. The script-build value is the first 12 characters of `carrier.py`'s SHA256, distinguishing changes within a version. `python carrier.py --version` requires no phone.
+
+**macOS says “Launch macOS.command is damaged… Move to Trash”.** This can be macOS blocking an unsigned download rather than a damaged file.
+
+1. Click **Cancel**, not Move to Trash.
+2. Open Terminal, type `bash ` with a trailing space, drag `Launch macOS.command` into the window and press Enter.
+
+To enable double-click launching, remove quarantine from the extracted folder once:
 
 ```bash
 /usr/bin/xattr -r -s -d com.apple.quarantine "$HOME/Downloads/CarrierSIM"
 ```
 
-**Windows не видит iPhone.** В «Проводнике» телефон есть (как `Apple iPhone`, видны фото), а iTunes и скрипт его не находят. Значит, не установлен драйвер Apple Mobile Device USB. Переустановка iTunes не всегда помогает. Скачайте драйвер «Apple Mobile Device USB Driver» из [Microsoft Update Catalog](https://www.catalog.update.microsoft.com/Search.aspx?q=Apple%20Mobile%20Device%20USB%20Driver), распакуйте `.cab` и в командной строке от администратора выполните `pnputil /add-driver usbaapl64.inf /install` из папки с распакованными файлами. Затем перезагрузите компьютер.
+**Windows cannot detect the iPhone.** If Explorer shows `Apple iPhone` and photos but iTunes and the script do not detect it, the Apple Mobile Device USB driver may be missing. Reinstalling iTunes does not always help. Download “Apple Mobile Device USB Driver” from [Microsoft Update Catalog](https://www.catalog.update.microsoft.com/Search.aspx?q=Apple%20Mobile%20Device%20USB%20Driver), extract the `.cab`, run `pnputil /add-driver usbaapl64.inf /install` in an administrator command prompt in that folder, then restart the computer.
 
-**«Grappa session could not be established».** iPhone отклонил обмен AirTraffic с компьютером. На Windows вызов `ATHostConnectionSendSyncRequest` мог приводить к этому сбою ещё при сохранении исходного каталога. Скрипт теперь создаёт соединение через `ATHostConnectionCreateWithLibrary` и отправляет `RequestingSync` с готовыми данными Grappa. Успешный обмен AirTraffic сам по себе не подтверждает работу VoWiFi, EVS или 5G.
+**“Grappa session could not be established”.** The iPhone rejected AirTraffic exchange. On Windows, `ATHostConnectionSendSyncRequest` could cause this even while backing up the original catalog. The script now uses `ATHostConnectionCreateWithLibrary` and sends `RequestingSync` with prepared Grappa data. Successful AirTraffic exchange does not by itself prove VoWiFi, EVS or 5G functionality.
 
-Если ошибка осталась, скрипт пишет «iPhone не принял компоненты Apple на этом компьютере» и не повторяет ту же попытку. Удалите iTunes (и версию из Microsoft Store, если есть), установите iTunes x64 по [инструкции на 4PDA](https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362), запустите его один раз и повторите. Ставьте полный установщик iTunes, а не только `AppleMobileDeviceSupport64.msi` из него. В одном случае помогла только версия 12.11.0.26, и перед первым запуском пришлось удалить старую медиатеку iTunes (иначе iTunes выдавал ошибку). Если скачивание на 4PDA выдаёт ошибку 404, нужна регистрация, вход в аккаунт и некоторая активность на форуме.
+If the error remains, the script reports that the iPhone rejected the Apple components on this computer and does not retry the same operation. Remove iTunes (including the Microsoft Store version, if present), install full iTunes x64 using the [4PDA instructions](https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362), launch it once, then try again. Use the full installer, not just `AppleMobileDeviceSupport64.msi`. In one case, only version 12.11.0.26 worked, and the old iTunes media library had to be removed before first launch to avoid an iTunes error. A 4PDA download returning 404 may require registration, login and some forum activity.
 
-**«iPhone запрещает установку (InstallProhibited)».** В «Экранном времени» запрещена установка приложений: «Настройки → Экранное время → Ограничения контента и конфиденциальности → Покупки в iTunes Store и App Store → Установка приложений» — поставьте «Да» на время установки. То же бывает у телефонов с профилем управления (MDM).
+**InstallProhibited:** Screen Time may prohibit installation: Settings → Screen Time → Content & Privacy Restrictions → iTunes & App Store Purchases → Installing Apps. Allow it temporarily. Managed (MDM) phones can impose the same restriction.
 
-**«iPhone запрещает изменить Books/Books.plist, а в нём остались записи скрипта».** Известный случай — во время этапа началась резервная копия iCloud ([#44](https://github.com/ios-bundles/CarrierSIM/issues/44)). Сохраните папку `runs` с резервными копиями. В одном случае помогла такая последовательность:
+**The iPhone refuses changes to Books/Books.plist while script entries remain.** A known cause is iCloud Backup starting during a stage ([#44](https://github.com/ios-bundles/CarrierSIM/issues/44)). Preserve `runs` and its backups. The following sequence helped in one case:
 
-1. Отключите iPhone от компьютера.
-2. Закройте все приложения на iPhone, смахнув их в переключателе приложений.
-3. Принудительно перезагрузите iPhone: быстро нажмите и отпустите кнопку увеличения громкости, затем кнопку уменьшения громкости, после этого удерживайте боковую кнопку до логотипа Apple ([инструкция Apple](https://support.apple.com/ru-ru/guide/iphone/-iph8903c3ee6/ios)).
-4. После загрузки разблокируйте iPhone и подключите его к компьютеру.
-5. В той же папке CarrierSIM повторите пункт 5 меню (`--recover`). Если ошибка повторится, отправьте автору текст ошибки и журнал сеанса.
+1. Disconnect the iPhone from the computer.
+2. Close all iPhone apps by swiping them away in the app switcher.
+3. Force restart: quickly press and release Volume Up, then Volume Down, then hold the side button until the Apple logo appears ([Apple instructions](https://support.apple.com/guide/iphone/force-restart-iphone-iph8903c3ee6/ios)).
+4. Unlock after startup and reconnect to the computer.
+5. In the same CarrierSIM folder, retry item **5** (`--recover`). If it fails again, send the error text and session log to the author.
 
-**«Служебные файлы Books постоянно меняются».** Закройте приложение «Книги» на iPhone, дождитесь окончания загрузки книг и повторите.
+**Books support files keep changing:** close Books, wait for book downloads to finish, then retry.
 
-**«Скрипт не может работать из этой папки».** Скопируйте папку CarrierSIM в «Загрузки» и запустите оттуда.
+**The script cannot run from this folder:** copy CarrierSIM into Downloads and launch it there.
 
-## Без кабеля: Wi-Fi (экспериментально)
+## Without a cable: Wi-Fi (experimental)
 
-Пункт **10** в меню или флаг `--wifi`. Те же службы идут через usbmuxd по сети, как синхронизация Finder по Wi-Fi. Полный цикл установки по Wi-Fi проверен на iPhone 16 Pro Max / iOS 27.0.1: работает, но медленнее, чем по кабелю. Если шаг AirTraffic по Wi-Fi не подключается («AirTraffic не ответил по Wi-Fi за 170 с»), а по кабелю проходит сразу, на macOS проверьте разрешение «Локальная сеть» для терминала («Системные настройки → Конфиденциальность и безопасность → Локальная сеть»): AirTraffic соединяется с iPhone напрямую, и без разрешения macOS молча режет соединение. В tmux, screen и SSH разрешения нет, запускайте `Запуск macOS.command` (в готовой сборке — `CarrierSIM`) из Finder или обычное окно терминала. В этом случае скрипт один раз откатывает телефон и не повторяет попытки по Wi-Fi. Дальше подключите кабель, пункт **10** → «кабель» и повторите. Если откат по Wi-Fi не прошёл (сообщение «Автовосстановление не завершено»), сначала выполните пункт **5** по кабелю.
+Use item **10** or `--wifi` for normal IMSI actions. The same services run over the network through usbmuxd, like Finder Wi-Fi sync. Full Wi-Fi installation was tested on iPhone 16 Pro Max / iOS 27.0.1; it works but is slower than USB. **GID1 apply/undo are excluded and remain USB-only.**
 
-Доверие по Wi-Fi не выдаётся: без готовой пары скрипт остановится и попросит кабель. Сеть должна пропускать Bonjour: гостевые сети и изоляция клиентов на роутере не подойдут.
+If AirTraffic does not connect within 170 seconds over Wi-Fi but works immediately over USB, check macOS Local Network permission for Terminal (System Settings → Privacy & Security → Local Network). AirTraffic connects directly to the iPhone; macOS silently blocks that connection without permission. Launch `Launch macOS.command` (or standalone `CarrierSIM`) from Finder or a normal terminal window, not tmux, screen or SSH. For this failure the script rolls back once and does not repeat Wi-Fi attempts. Connect USB, switch item **10** to USB and retry. If Wi-Fi rollback failed, use item **5** over USB first.
 
-На macOS терминалу нужно разрешение «Локальная сеть» («Системные настройки → Конфиденциальность и безопасность → Локальная сеть»). Статус и чтение идут через системную службу usbmuxd и работают без него, а шаг AirTraffic соединяется с iPhone напрямую, и без разрешения macOS его молча режет. Скрипт проверяет это перед установкой. При первом запуске macOS может показать окно «Локальная сеть»: нажмите «Разрешить», скрипт ждёт ответа до 20 с. Нет разрешения — останавливается с подсказкой. Откат (пункт **5**) проверяет только перед возвратом каталога операторов: если осталось вернуть одни Книги, разрешение не нужно. Из tmux, screen и SSH macOS разрешения не спрашивает и доступ запрещает: запускайте `Запуск macOS.command` (в готовой сборке — `CarrierSIM`) из Finder или обычное окно терминала.
+Wi-Fi cannot establish Trust: without an existing pairing the script asks for USB. The network must allow Bonjour; guest networks and client isolation will not work.
 
-### Как проверить
+On macOS, status/log reading through system usbmuxd can work without Local Network permission, but the direct AirTraffic transfer cannot. The script checks before installation. If macOS displays the permission prompt, click Allow; the script waits up to 20 seconds. Without permission it stops with guidance. Recovery checks permission only before restoring the carrier catalog; Books-only cleanup does not require it. macOS does not prompt from tmux, screen or SSH and denies access there.
 
-**Подготовка (с кабелем, один раз)**
+### How to test Wi-Fi
 
-1. Подключите iPhone кабелем, разблокируйте, нажмите «Доверять».
-2. Запустите меню, пункт **2**. SIM должны показаться: доверие есть.
-3. Откройте Finder → iPhone в боковой панели → вкладка «Основные» → включите «Показывать этот iPhone, если он подключён к Wi-Fi» → «Применить». На Windows то же в iTunes, «Обзор» → «Параметры».
-4. Закройте Finder/iTunes и отключите кабель.
+**One-time preparation over USB**
 
-**Проверка связи (ничего не пишет)**
+1. Connect USB, unlock and tap Trust.
+2. Run menu item **2**. If SIMs appear, pairing works.
+3. Finder → iPhone sidebar → General → enable “Show this iPhone when on Wi-Fi” → Apply. On Windows, use iTunes → Summary → Options.
+4. Close Finder/iTunes and disconnect USB.
 
-5. iPhone и компьютер в одной сети Wi-Fi (не гостевой, без изоляции клиентов). iPhone разблокирован, экран не гаснет.
-6. Меню: **10** (должно стать «Wi-Fi»), затем **2**.
-7. Появились SIM и план — связь по Wi-Fi работает. «iPhone не виден по Wi-Fi» — не включена галка из шага 3, телефон спит или сеть режет Bonjour. «Нет доверия» — повторите шаги 1–2.
+**Connection test (no writes)**
 
-**Установка**
+5. Put the phone and computer on the same non-guest Wi-Fi without client isolation. Keep the phone unlocked and awake.
+6. Choose **10** (Wi-Fi), then **2**.
+7. A SIM list and plan prove Wi-Fi connectivity. If the phone is not visible, check step 3, sleep and Bonjour. If Trust is missing, repeat steps 1–2.
 
-8. Кабель держите под рукой. Меню: **10** → Wi-Fi, затем **1**.
-9. Установка идёт дольше, чем по кабелю, — это нормально. Если сеть нестабильна и выпадает «Сбой AirTraffic», подключите кабель и повторите в режиме «кабель».
-10. При сбое скрипт сам откатывает телефон, тоже по Wi-Fi. Если телефон уснул или пропал из сети посреди записи, этап прерывается через 5 минут, дальше откат. Не откатил — подключите кабель, **10** → кабель, **5**.
-11. «Готово» — проверьте VoWiFi по разделу «После установки».
+**Normal IMSI installation**
 
-Журналы каждого запуска лежат в `runs`, `host.jsonl` — ответы AirTraffic. Их и прикладывайте к отчёту. Журналы iPhone (`commcenter.log`, `device.log`) пишутся обезличенными: IMSI и ICCID ваших SIM заменены на `<imsi>` и `<iccid>`, другие длинные номера и телефоны — на `<num>`, имя телефона — на `iPhone`. Журналы версий до этой правки так не маскировались. Zip-архивы в `runs` (копии каталога, `media-leftovers`) не маскируются вообще: в них есть IMSI, не публикуйте их.
+8. Keep USB nearby. Choose **10** → Wi-Fi, then **1**.
+9. It takes longer than USB. If unstable networking causes an AirTraffic failure, connect USB and retry in USB mode.
+10. The script also rolls back over Wi-Fi after failure. If the phone sleeps or disappears mid-write, the stage times out after 5 minutes and rollback follows. If rollback fails, connect USB, choose **10** → USB, then **5**.
+11. After completion, test VoWiFi as described above.
 
-## Для продвинутых
+Logs are in `runs`; `host.jsonl` contains AirTraffic responses. Include relevant logs with a report. Phone logs (`commcenter.log`, `device.log`) replace SIM IMSI/ICCID with `<imsi>`/`<iccid>`, other long numbers and phone numbers with `<num>`, and the device name with `iPhone`. Older logs did not have this masking. ZIP archives (catalog backups and `media-leftovers`) are not masked and contain IMSI; do not publish them.
 
-```bash
-python3 carrier.py --status                          # SIM и план, без записи
-python3 carrier.py --wifi --status                   # то же по Wi-Fi
-python3 carrier.py                                   # Vodafone HU на все SIM
-python3 carrier.py --bundle O2_Germany --sims 1      # другой профиль, только SIM 1
-python3 carrier.py --restore                         # вернуть штатные профили
-python3 carrier.py --restore --sims 2               # только для SIM 2
-python3 carrier.py --help                            # все флаги
+## Advanced usage
+
+```sh
+python3 carrier.py --status                         # SIMs and plan, no writes
+python3 carrier.py --wifi --status                  # same over Wi-Fi
+python3 carrier.py                                  # bundle.yaml for eligible SIMs
+python3 carrier.py --bundle O2_Germany --sims 1       # another bundle, SIM 1 only
+python3 carrier.py --restore                        # remove IMSI overrides
+python3 carrier.py --restore --sims 2                # SIM 2 IMSI override only
+python3 carrier.py --help                           # all flags
 ```
 
-На Windows вместо `python3` пишите `py`. Подробное техническое описание есть в [README.txt](README.txt).
+On Windows use `py` instead of `python3`. See [README.txt](README.txt) for technical details, source URLs and checksums.
 
-**Библиотеки iTunes из Microsoft Store.** Для нестандартной установки укажите папку библиотек через `py carrier.py --check --apple-dir "C:\AppleRuntime"`; при установке используйте тот же `--apple-dir`. Путь к пакету можно узнать командой PowerShell `Get-AppxPackage AppleInc.iTunes | Select-Object -ExpandProperty InstallLocation`. При загрузке прямо из `WindowsApps` возможен `WinError 5`: в этом случае скопируйте DLL из корня пакета, папку `CoreFoundation.resources` и DLL из его `AMDS64` в отдельную папку, например `C:\AppleRuntime`. Используйте файлы одной версии. Эта настройка выбирает библиотеки AirTraffic; для связи с iPhone нужны также работающая служба и драйвер Apple Mobile Device.
+**Microsoft Store iTunes libraries:** for a nonstandard installation, specify the library folder with `py carrier.py --check --apple-dir "C:\AppleRuntime"`; use the same `--apple-dir` when installing. Find the package with PowerShell: `Get-AppxPackage AppleInc.iTunes | Select-Object -ExpandProperty InstallLocation`. Direct loading from `WindowsApps` may fail with `WinError 5`; copy the root DLLs, `CoreFoundation.resources` and DLLs from `AMDS64` into a separate folder such as `C:\AppleRuntime`. Keep all files from one version. This chooses AirTraffic libraries; a working Apple Mobile Device service and driver are also required.
 
----
+## Local changes
 
-## Лицензия
+- Added USB-only automatic T-Mobile Wholesale installation/removal: discover the actual matched GID1 key, bind the alias to the full selected ICCID, verify carrier/operator selections, and leave a successful installation applied. Recognizes older qualified owner journals without rewriting them.
+- Switched user-facing code and shipped documentation to English; launchers are now `Launch macOS.command`, `Launch Windows.cmd` and `Launch Linux.sh`. Existing IMSI behavior and historical run artifacts are unchanged.
+- Fixed carrier-switch connection-loss verification to reconnect without reapplying the alias; generic recovery no longer uninstalls healthy profiles. Added regressions for automatic selection, real-key discovery, idempotence, scoped removal, ownership/identity conflicts and interrupted verification. Local verification: **172 tests run, 2 skipped; suite passed**. Six isolated actual CLI/menu scenarios exercised cancellation, installation, reconnect, repeat/no-op, healthy recovery and explicit removal. Fresh automatic installation has not been repeated on physical hardware; the retained manual qualified installation has live signature evidence and user-reported working/reboot persistence.
 
-Собственный код CarrierSIM распространяется под [MIT](LICENSE). Copyright © 2026 Vladimir B / vlw и участники проекта. При распространении копий или существенных частей кода сохраняйте авторское уведомление и текст лицензии.
+## License
 
-Сторонний код сохраняет свои лицензии. Лицензия CarrierSIM не распространяется на файлы Apple, включая IPCC-триггеры в `assets.zip`, системные пакеты операторов и библиотеки Apple: права на них принадлежат соответствующим правообладателям.
+CarrierSIM's own code is distributed under [MIT](LICENSE). Copyright © 2026 Vladimir B / vlw and contributors. Preserve the copyright notice and license text when distributing copies or substantial portions of the code.
 
-Протокол переноса основан на [AirLift](https://github.com/0xjohnnydev/airlift) (MIT, лицензия в [LICENSE-AirLift.txt](LICENSE-AirLift.txt)).
-Обмен Grappa на Windows адаптирован из [AirCard-Windows](https://github.com/dhava-gautama/AirCard-Windows/blob/e0eadb0c88da55516f1c9f939fd4ce27560910d5/src/airtraffic.rs); лицензия MIT — в [LICENSE-AirCard.txt](LICENSE-AirCard.txt). Готовые данные Grappa в этом коде взяты из `yinyajiang/go-tunes`.
+Third-party code retains its licenses. CarrierSIM's license does not apply to Apple files, including IPCC triggers in `assets.zip`, system carrier bundles and Apple libraries; those belong to their respective rights holders.
 
-## Автоматические проверки
+The transfer protocol is based on [AirLift](https://github.com/0xjohnnydev/airlift) (MIT; [LICENSE-AirLift.txt](LICENSE-AirLift.txt)). Windows Grappa exchange is adapted from [AirCard-Windows](https://github.com/dhava-gautama/AirCard-Windows/blob/e0eadb0c88da55516f1c9f939fd4ce27560910d5/src/airtraffic.rs); its MIT license is in [LICENSE-AirCard.txt](LICENSE-AirCard.txt). Its prepared Grappa data came from `yinyajiang/go-tunes`.
 
-Workflow **Tests** запускается на коммитах в ветках и в pull request. Матрица проверяет Python **3.11–3.14** на Windows, Linux, macOS **15 и 26** (Apple Silicon и Intel) и macOS **27** (Apple Silicon, образ GitHub `xcode-27` в режиме public preview): установку зависимостей через тот же код, что использует запускатель, импорты сервисов, компиляцию исходников и регрессионные тесты. Это **28 сочетаний** Python и ОС. Фактические версии ОС и Python и архитектура выводятся в журнал задания. Общий статус **Python compatibility** успешен только после прохождения всей матрицы; его можно назначить обязательной проверкой в правилах ветки.
+## Automated checks
 
-Тесты проверяют архивы и резервные копии, конфигурацию профилей, выбор и восстановление SIM, обработку ошибок, служебные файлы Books и логи. Они используют временные файлы и имитацию границ подключения, не подключаются к телефону и не заменяют проверку на реальном iPhone.
+The **Tests** workflow runs on branch commits and pull requests. It checks Python **3.11–3.14** on Windows, Linux, macOS **15** (Intel), macOS **26** (Apple Silicon and Intel) and macOS **27** (Apple Silicon, GitHub's public-preview `xcode-27` image). The **24 combinations** install dependencies through the launcher code, check service imports, compile sources and run regression tests. Actual OS/Python versions and architecture appear in the job log. **Python compatibility** succeeds only when the entire matrix passes and can be required in branch rules.
 
-Локальный запуск без установки зависимостей и подключения телефона:
+Tests cover archives/backups, profile configuration, SIM selection/restoration, failures, Books support files and logs. They use temporary files and simulated connection boundaries, never connect to a phone, and do not replace real-iPhone testing.
+
+Local test command without installing dependencies or connecting a phone:
 
 ```sh
 python -m unittest discover -s tests -v

@@ -29,7 +29,7 @@ class AtcError(RuntimeError):
 def frame(message):
     raw = plistlib.dumps(message, fmt=plistlib.FMT_BINARY, sort_keys=False)
     if len(raw) > MAX_ATC_FRAME:
-        raise AtcError('Слишком большое сообщение AirTraffic')
+        raise AtcError('AirTraffic message is too large')
     return len(raw).to_bytes(4, 'little') + raw
 
 
@@ -41,13 +41,13 @@ async def self_check():
         callable(getattr(ServiceConnection, name, None))
         for name in ('recvall', 'sendall', 'close')
     ):
-        raise AtcError('Несовместимая версия pymobiledevice3 для AirTraffic')
+        raise AtcError('Incompatible pymobiledevice3 version for AirTraffic')
     sample = {'Command': 'Ping', 'Session': 1}
     encoded = frame(sample)
     if int.from_bytes(encoded[:4], 'little') != len(encoded) - 4 or plistlib.loads(encoded[4:]) != sample:
-        raise AtcError('Ошибка кодирования AirTraffic')
+        raise AtcError('AirTraffic encoding failed')
     if len(GRAPPA_TOKEN) != 84:
-        raise AtcError('Неверный Grappa token')
+        raise AtcError('Invalid Grappa token')
     return {'ok': True, 'backend': BACKEND, 'deviceConnections': 0}
 
 
@@ -63,27 +63,27 @@ class NativeAtcClient:
     async def read_message(self):
         header = await self.service.recvall(4)
         if len(header) != 4:
-            raise AtcError('Соединение AirTraffic закрыто')
+            raise AtcError('AirTraffic connection closed')
         length = int.from_bytes(header, 'little')
         if not 0 < length <= MAX_ATC_FRAME:
-            raise AtcError(f'Неверная длина AirTraffic frame: {length}')
+            raise AtcError(f'Invalid AirTraffic frame length: {length}')
         raw = await self.service.recvall(length)
         if len(raw) != length:
-            raise AtcError('Неполное сообщение AirTraffic')
+            raise AtcError('Incomplete AirTraffic message')
         try:
             message = plistlib.loads(raw)
         except Exception as error:
-            raise AtcError('Неверный binary plist AirTraffic') from error
+            raise AtcError('Invalid AirTraffic binary plist') from error
         if not isinstance(message, dict):
-            raise AtcError('Сообщение AirTraffic не является словарём')
+            raise AtcError('AirTraffic message is not a dictionary')
         command, session = message.get('Command'), message.get('Session')
         if not isinstance(command, str) or type(session) is not int or session not in (0, 1):
-            raise AtcError('Неверный envelope AirTraffic')
+            raise AtcError('Invalid AirTraffic envelope')
         if message.get('Type') != 0:
-            raise AtcError('Неподдерживаемый тип сообщения AirTraffic')
+            raise AtcError('Unsupported AirTraffic message type')
         params = message.get('Params', {})
         if not isinstance(params, dict):
-            raise AtcError('Неверные параметры AirTraffic')
+            raise AtcError('Invalid AirTraffic parameters')
         return message
 
     async def send_message(self, command, session, params=None):
@@ -118,7 +118,7 @@ class NativeAtcClient:
         self.emit({'event': 'message', 'name': command, 'session': message['Session']})
         if command == 'SyncFailed':
             code = message.get('Params', {}).get('ErrorCode')
-            raise AtcError(f'iPhone отклонил AirTraffic sync (код {code})')
+            raise AtcError(f'iPhone rejected AirTraffic sync (code {code})')
         return message
 
     async def wait_for(self, wanted, session):
@@ -127,42 +127,42 @@ class NativeAtcClient:
             command = message['Command']
             if command == wanted:
                 if message['Session'] != session and not (wanted == 'SyncAllowed' and message['Session'] in (0, 1)):
-                    raise AtcError(f'Неверная сессия {command}: {message["Session"]}')
+                    raise AtcError(f'Invalid {command} session: {message["Session"]}')
                 return message
             if command == 'SyncFinished':
-                raise AtcError('Синхронизация закончилась преждевременно')
+                raise AtcError('Synchronization ended prematurely')
             if command == 'SyncAllowed' and wanted != 'SyncAllowed' and message['Session'] == 1:
                 protected = message.get('Params', {}).get('DataProtected')
                 if protected is True:
-                    raise AtcError('iPhone заблокирован или данные защищены')
+                    raise AtcError('iPhone is locked or its data is protected')
                 if protected is False:
                     continue
             if command in ('Capabilities', 'InstalledAssets', 'AssetMetrics'):
                 if command == 'Capabilities' and self.grappa_support is not None and not self.grappa_sent and wanted != 'SyncAllowed':
-                    raise AtcError('Grappa capability получена после HostInfo; синхронизация остановлена')
+                    raise AtcError('Grappa capability arrived after HostInfo; synchronization stopped')
                 continue
-            raise AtcError(f'Неожиданное сообщение AirTraffic: {command}')
+            raise AtcError(f'Unexpected AirTraffic message: {command}')
 
     async def handshake(self):
         allowed = await self.wait_for('SyncAllowed', 0)
         protected = allowed.get('Params', {}).get('DataProtected')
         if protected is True:
-            raise AtcError('iPhone заблокирован или данные защищены')
+            raise AtcError('iPhone is locked or its data is protected')
         if protected is not None and protected is not False:
-            raise AtcError('Неверное поле DataProtected')
+            raise AtcError('Invalid DataProtected field')
         # Capabilities may trail SyncAllowed in the startup burst.
         await asyncio.sleep(.1)
         while not self.messages.empty():
             queued = await self.next_message()
             if queued['Command'] != 'Capabilities':
-                raise AtcError(f'Неожиданное сообщение до HostInfo: {queued["Command"]}')
+                raise AtcError(f'Unexpected message before HostInfo: {queued["Command"]}')
         support = self.grappa_support
         if support is not None:
             keys = ('version', 'deviceType', 'protocolVersion')
             if (not isinstance(support, dict) or
                     any(type(support.get(k)) is not int for k in keys) or
                     tuple(support[k] for k in keys) != (1, 0, 1)):
-                raise AtcError(f'AirTraffic использует неподдерживаемый вариант Grappa: {support}')
+                raise AtcError(f'AirTraffic uses an unsupported Grappa variant: {support}')
         host_info = {
             'Type': 'iTunes', 'Version': '13.7.0.161', 'MacOSVersion': 'Linux',
             'SyncHostName': 'CarrierSIM', 'LibraryID': str(uuid.uuid4()),
@@ -189,14 +189,14 @@ class NativeAtcClient:
                     message = incoming.result()
                     command = message['Command']
                     if command not in ('AssetMetrics', 'InstalledAssets', 'Capabilities'):
-                        raise AtcError(f'Неожиданное сообщение до commit: {command}')
+                        raise AtcError(f'Unexpected message before commit: {command}')
                     if command == 'Capabilities' and self.grappa_support is not None and not self.grappa_sent:
-                        raise AtcError('Grappa capability получена после HostInfo; синхронизация остановлена')
+                        raise AtcError('Grappa capability arrived after HostInfo; synchronization stopped')
                     incoming = asyncio.create_task(self.next_message())
                     continue
                 if approval in done:
                     if not approval.result():
-                        raise AtcError('Резервная копия не подтверждена')
+                        raise AtcError('Backup was not confirmed')
                     return
         finally:
             for task in (approval, incoming):
@@ -210,13 +210,13 @@ class NativeAtcClient:
         message = await self.wait_for('AssetManifest', 1)
         manifest = message.get('Params', {}).get('AssetManifest')
         if not isinstance(manifest, dict) or not isinstance(manifest.get('Book'), list):
-            raise AtcError('Неверный манифест AirTraffic')
+            raise AtcError('Invalid AirTraffic manifest')
         books = manifest['Book']
         expected = [asset_id for asset_id, _ in assets]
         if len(expected) != len(set(expected)):
-            raise AtcError('Повторяющиеся ожидаемые AssetID')
+            raise AtcError('Duplicate expected AssetIDs')
         if any(isinstance(row, dict) and not isinstance(row.get('AssetID'), str) for row in books):
-            raise AtcError('Неверный AssetID в манифесте AirTraffic')
+            raise AtcError('Invalid AssetID in AirTraffic manifest')
         counts = Counter(row.get('AssetID') for row in books if isinstance(row, dict))
         downloadable = {row.get('AssetID') for row in books
                         if isinstance(row, dict) and row.get('IsDownload') is True}
@@ -225,7 +225,7 @@ class NativeAtcClient:
         if missing or duplicate:
             self.emit({'event': 'manifest', 'expected': len(assets), 'matched': len(assets) - len(missing),
                        'duplicate': len(duplicate)})
-            raise AtcError(f'AirTraffic не подтвердил нужные объекты: отсутствует {len(missing)}, повторяется {len(duplicate)}')
+            raise AtcError(f'AirTraffic did not confirm the required assets: {len(missing)} missing, {len(duplicate)} duplicated')
         self.emit({'event': 'manifest', 'expected': len(assets), 'matched': len(assets)})
         for index, (asset_id, destination) in enumerate(assets):
             if index == 2:
@@ -256,7 +256,7 @@ async def run_session(udid, connection_type, assets, emit, authorize, *, probe=F
                         if not probe:
                             await client.sync_assets(assets, authorize)
                 except TimeoutError as error:
-                    raise AtcError('Превышено время ожидания AirTraffic') from error
+                    raise AtcError('AirTraffic timed out') from error
             finally:
                 client.reader.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

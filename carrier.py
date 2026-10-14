@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vodafone HU для всех обнаруженных SIM по полному IMSI."""
+"""Carrier profiles using exact IMSI aliases and explicit experimental GID1 aliases."""
 from __future__ import annotations
 import argparse
 import asyncio
@@ -68,8 +68,8 @@ def require(ok, message):
 def recover_hint():
     # The launcher menu runs this script with CARRIERSIM_MENU=1; its users never type flags.
     if os.environ.get('CARRIERSIM_MENU'):
-        return 'выберите в меню пункт 5 «Восстановить после сбоя»'
-    return 'запустите скрипт с флагом --recover'
+        return 'choose menu item 5 (Recover after failure)'
+    return 'run the script with --recover'
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -81,6 +81,13 @@ def save_json(path, value):
         f.flush()
         os.fsync(f.fileno())
     tmp.replace(path)
+    # The rename must survive a host crash, not only the contents of the temporary file.
+    if os.name != 'nt':
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 def safe_name(name):
     require(bool(name) and not name.startswith('/') and '\\' not in name and
@@ -165,7 +172,7 @@ def staging_archive(payload=None):
         for kind, data in payload.values():
             if kind == 'l' and data.startswith(SYSTEM_PREFIX.encode()):
                 name = data.decode().removeprefix(SYSTEM_PREFIX)
-                require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle', name), 'Неожиданная системная ссылка')
+                require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle', name), 'Unexpected system symlink')
                 system_names.add(name)
         for name in system_names:
             directories(SYSTEM_BUNDLE_DIR+'/'+name)
@@ -188,8 +195,8 @@ async def remote_tree(afc, root):
     total = 0
     async def visit(path, name='', depth=0):
         nonlocal total
-        require(depth < 32, 'Слишком глубокая вложенность папок: ' + path)
-        require(len(tree) < MAX_NODES, f'Больше {MAX_NODES} объектов в {root}: лимит скрипта')
+        require(depth < 32, 'Directory nesting is too deep: ' + path)
+        require(len(tree) < MAX_NODES, f'More than {MAX_NODES} nodes in {root}: safety limit')
         before = await afc.stat(path)
         kind = before['st_ifmt']
         if kind == 'S_IFDIR':
@@ -205,12 +212,12 @@ async def remote_tree(afc, root):
             tree[name] = ('l', before['LinkTarget'].encode())
         elif kind == 'S_IFREG':
             require(name, 'Root is a file')
-            require(before['st_size'] <= MAX_BYTES, f'Файл больше {MAX_BYTES >> 20} МБ: {path} ({before["st_size"] >> 20} МБ)')
+            require(before['st_size'] <= MAX_BYTES, f'File exceeds {MAX_BYTES >> 20} MB: {path} ({before["st_size"] >> 20} MB)')
             data = await afc.get_file_contents(path)
-            require(len(data) == before['st_size'], 'Файл изменился во время чтения: ' + path)
+            require(len(data) == before['st_size'], 'File changed while reading: ' + path)
             total += len(data)
-            require(total <= MAX_BYTES, f'В {root} больше {MAX_BYTES >> 20} МБ данных (прочитано {total >> 20} МБ, '
-                                        f'последний файл {path}, {len(data) >> 10} КБ): лимит скрипта')
+            require(total <= MAX_BYTES, f'{root} exceeds {MAX_BYTES >> 20} MB (read {total >> 20} MB, '
+                                        f'last file {path}, {len(data) >> 10} KB): safety limit')
             tree[name] = ('f', data)
         else:
             raise RuntimeError('Unsupported remote node: ' + path)
@@ -242,9 +249,9 @@ async def read_managed_books(afc):
         if found is None:
             continue
         require(found['st_ifmt'] == 'S_IFREG', 'Unexpected Books sync artifact: ' + path)
-        require(found['st_size'] <= MAX_BYTES, f'Файл больше {MAX_BYTES >> 20} МБ: {path}')
+        require(found['st_size'] <= MAX_BYTES, f'File exceeds {MAX_BYTES >> 20} MB: {path}')
         data = await afc.get_file_contents(path)
-        require(len(data) == found['st_size'], 'Файл изменился во время чтения: ' + path)
+        require(len(data) == found['st_size'], 'File changed while reading: ' + path)
         tree[path.removeprefix('Books/')] = ('f', data)
     validate_tree(tree)
     return True, tree
@@ -260,8 +267,8 @@ async def books_snapshot(afc, run):
             break
         state = again
     else:
-        raise RuntimeError('Служебные файлы Books постоянно меняются: закройте приложение «Книги» '
-                           'на iPhone, дождитесь окончания загрузки книг и повторите.')
+        raise RuntimeError('Books sync files keep changing: close the Books app '
+                           'on the iPhone, wait for book downloads to finish and try again.')
     existed, tree = state
     write_tree_zip(run / 'books.zip', tree)
     top = sorted(await afc.listdir('Books')) if existed else []
@@ -315,9 +322,9 @@ async def purge_stale_books(afc, run):
             # Any other AFC failure (no space, lost connection) must not pass as "denied".
             if error.status != AFC_PERM_DENIED:
                 raise
-            removed[path] = 'запись запрещена: ' + error_text(error)
+            removed[path] = 'write denied: ' + error_text(error)
             continue
-        require(await afc.get_file_contents(path) == clean, 'Не удалось очистить ' + path)
+        require(await afc.get_file_contents(path) == clean, 'Could not clean ' + path)
         removed[path] = len(items) - len(data['Books'])
     return removed
 
@@ -362,12 +369,12 @@ async def purge_outstanding(afc, run):
     try:
         rows = [r[0] or '' for r in read_outstanding(files)]
     except sqlite3.Error as error:
-        return 'не прочитана: ' + error_text(error)
+        return 'could not read: ' + error_text(error)
     mine = [x for x in rows if our_trace(x)]
     if not mine:
         return 0
     if len(mine) != len(rows):
-        return f'оставлена: наших {len(mine)} из {len(rows)}'
+        return f'retained: {len(mine)} of {len(rows)} entries belong to this tool'
     (run / 'books-stale').mkdir(exist_ok=True)
     for suffix, data in files.items():
         (run / 'books-stale' / ('OutstandingAssets_4.sqlite' + suffix)).write_bytes(data)
@@ -391,19 +398,19 @@ async def clean_phone(device, run):
                     (run / 'media-leftovers').mkdir(exist_ok=True)
                     copy = run / 'media-leftovers' / (name + '.zip')
                     write_tree_zip(copy, tree)
-                    require(read_tree_zip(copy) == tree, 'копия не совпала')
+                    require(read_tree_zip(copy) == tree, 'backup mismatch')
                 except Exception as error:
-                    report[name] = 'не удалён: локальная копия не сохранена: ' + error_text(error)
+                    report[name] = 'not removed: local backup was not saved: ' + error_text(error)
                     continue
             try:
                 await remove_tree(afc, name)
-                report[name] = 'удалён'
+                report[name] = 'removed'
             except Exception as error:
-                report[name] = 'не удалён: ' + error_text(error)
+                report[name] = 'not removed: ' + error_text(error)
         lists = await purge_stale_books(afc, run)
-        if lists: report['списки Books'] = lists
+        if lists: report['Books lists'] = lists
         outstanding = await purge_outstanding(afc, run)
-        if outstanding: report['загрузки Books'] = outstanding
+        if outstanding: report['Books downloads'] = outstanding
     save_json(run / 'cleanup.json', report)
     DIAG['cleanup'] = report
     return report
@@ -420,15 +427,15 @@ async def books_change(afc, path, action, denied):
             raise
         data = await afc.get_file_contents(path) if await exists(afc, path) else b''
         require(not our_trace(data),
-                'iPhone запрещает изменить ' + path + ', а в нём остались записи скрипта. '
-                'Копии сохранены в папке runs — не удаляйте её. '
-                'Попробуйте: отключите iPhone от компьютера, закройте все приложения '
-                '(смахните их в переключателе приложений), затем принудительно перезагрузите iPhone: '
-                'быстро нажмите и отпустите увеличение громкости, затем уменьшение громкости, '
-                'после этого удерживайте боковую кнопку до логотипа Apple. '
-                'После загрузки разблокируйте iPhone, подключите его к компьютеру и повторите '
-                'пункт 5 (--recover) из той же папки CarrierSIM. '
-                'Если ошибка повторится, сообщите автору её текст и журнал сеанса.')
+                'iPhone refuses to modify ' + path + ', which still contains this tool\'s entries. '
+                'Backups are saved in runs; do not delete it. '
+                'Disconnect the iPhone, close all apps '
+                '(swipe them away in the app switcher), then force-restart the iPhone: '
+                'quickly press and release Volume Up, then Volume Down, '
+                'then hold the side button until the Apple logo appears. '
+                'After startup, unlock the iPhone, reconnect it and retry '
+                'menu item 5 (--recover) from the same CarrierSIM folder. '
+                'If this recurs, report the error and session log to the author.')
         denied.add(path.removeprefix('Books/'))
 
 
@@ -478,10 +485,10 @@ async def restore_books(afc, tree, existed, top=None):
     diff = ([f'+{n}' for n in sorted(after.keys() - tree.keys())] +
             [f'-{n}' for n in sorted(tree.keys() - after.keys())] +
             [f'~{n}' for n in sorted(tree.keys() & after.keys()) if tree[n] != after[n]])
-    require(not diff, 'Не удалось вернуть служебные файлы Books на iPhone в исходное состояние. '
-            'Копии сохранены в папке runs — не удаляйте её. Сообщите автору текст этой ошибки. '
-            'Отличаются (+ появилось, - пропало, ~ изменилось): ' + ', '.join(diff[:10]))
-    kept = sorted('!' + n + ' (запись запрещена iOS)' for n in denied)
+    require(not diff, 'Could not restore the original Books sync files on the iPhone. '
+            'Backups are saved in runs; do not delete it. Report this error to the author. '
+            'Differences (+ added, - missing, ~ changed): ' + ', '.join(diff[:10]))
+    kept = sorted('!' + n + ' (write denied by iOS)' for n in denied)
     if top is None:
         return kept
     now = set(await afc.listdir('Books')) if await exists(afc, 'Books') else set()
@@ -494,20 +501,33 @@ DEVICE_LOG_KEYS = ('atc', 'airtraffic', 'book', 'sandbox', 'deny', 'airlift', 'c
 
 
 @contextlib.asynccontextmanager
-async def syslog_capture(device, path, keep, status=None, linger=1):
-    # Diagnostics only: a slow, broken or overflowing syslog never fails the operation.
-    # Its error goes into the log file and, when given, status['log_error'].
+async def syslog_capture(device, path, keep, status=None, linger=1, *, unified=False):
+    # Transfer logs are diagnostic; trigger selection checks require an intact capture.
+    # Capture errors are recorded in the file and, when given, status['log_error'].
     # Lines are masked before disk: user bundle links are named by IMSI, and these logs get attached to issues.
     from pymobiledevice3.services.syslog import SyslogService
+    from pymobiledevice3.services.os_trace import OsTraceService, OsActivityStreamFlag, OS_TRACE_RELAY_STREAM_FLAGS_DEFAULT
     ready = asyncio.Event()
     async def watch():
         try:
-            async with SyslogService(device) as log:
-                ready.set()
+            pid = await commcenter_pid(device, first=True) if unified else None
+            require(not unified or pid is not None, 'CommCenter process not found on the iPhone.')
+            async with (OsTraceService(device) if unified else SyslogService(device)) as log:
+                if not unified:
+                    ready.set()
+                # Trigger verification must not replay selections from before this rescan.
+                rows = (log.syslog(pid=pid, stream_flags=OS_TRACE_RELAY_STREAM_FLAGS_DEFAULT &
+                                   ~OsActivityStreamFlag.HISTORICAL) if unified else log.watch())
                 size = 0
                 with path.open('w', encoding='utf-8') as f:
-                    async for row in log.watch():
-                        line = row.decode(errors='replace') if isinstance(row, bytes) else row
+                    async for row in rows:
+                        if unified:
+                            if not row.filename.endswith('/CommCenter'):
+                                continue
+                            ready.set()
+                            line = f'{row.timestamp:%b %d %H:%M:%S} iPhone CommCenter[{row.pid}] <{row.level.name}>: {row.message}'
+                        else:
+                            line = row.decode(errors='replace') if isinstance(row, bytes) else row
                         if keep(line):
                             # The second field is the phone's name, often the owner's.
                             line = mask_ids(re.sub(r'^(\w{3} +\d+ [\d:]+ )\S+ ', r'\1iPhone ', line))
@@ -519,6 +539,7 @@ async def syslog_capture(device, path, keep, status=None, linger=1):
         except Exception as error:
             if status is not None:
                 status['log_error'] = error_line(error)
+                status['log_interrupted'] = gid_connection_lost(error)
             with contextlib.suppress(Exception):
                 with path.open('a', encoding='utf-8') as f: f.write('LOG ERROR: ' + mask_ids(repr(error)) + '\n')
         finally:
@@ -555,23 +576,23 @@ class GrappaRefused(RuntimeError):
 
 
 def grappa_hint(cause=''):
-    text = ('iPhone не принял компоненты Apple на этом компьютере (в журнале iPhone: «' + GRAPPA_REFUSED + '»), '
-            'повтор не поможет.')
+    text = ('iPhone rejected this computer\'s Apple components (iPhone log: «' + GRAPPA_REFUSED + '»), '
+            'retrying will not help.')
     if sys.platform == 'win32':
-        text += (' Переустановите iTunes: удалите его (и версию из Microsoft Store, если есть), установите iTunes x64 '
-                 'по ссылке https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362, '
-                 'запустите один раз и повторите. '
-                 'Если скачивание на 4PDA выдаёт ошибку 404, нужна регистрация, вход в аккаунт и некоторая активность на форуме. '
-                 'Подробнее — README, раздел «Grappa session could not be established».')
+        text += (' Reinstall iTunes: remove it (including any Microsoft Store version), install iTunes x64 '
+                 'from https://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362, '
+                 'launch it once and try again. '
+                 'A 404 on 4PDA requires registration, sign-in and some forum activity. '
+                 'See the README section on Grappa session could not be established.')
     else:
-        text += ' Скопируйте блок отладки выше в issue на GitHub.'
+        text += ' Copy the debug block above into a GitHub issue.'
     # The host's own error stays in the message: journals and the debug block keep the real failure.
-    return text + (f' Ошибка хоста: {cause}' if cause else '')
+    return text + (f' Host error: {cause}' if cause else '')
 
 
 def grappa_failure(error, log):
     # Only the host's own failure: an AFC or Books error inside the pause keeps its cause and retries.
-    if isinstance(error, RuntimeError) and 'Сбой AirTraffic' in str(error) and grappa_refused(log):
+    if isinstance(error, RuntimeError) and 'AirTraffic failure' in str(error) and grappa_refused(log):
         return GrappaRefused(grappa_hint(str(error)))
     return None
 
@@ -580,9 +601,9 @@ def grappa_failure(error, log):
 # neither the export nor the write happens. Earlier 27.2 betas still worked. The stop is decided by
 # that refusal in the iPhone log, not by the version: the version only gives a warning up front.
 AIRLIFT_REFUSED = 'Failed to move completed file for asset'
-AIRLIFT_CLOSED_TEXT = ('iPhone не переносит файлы AirTraffic в каталог операторов: на этой версии iOS Apple закрыла '
-                       'способ, которым скрипт меняет настройки оператора, повтор не поможет. Уже установленный '
-                       'профиль остаётся.')
+AIRLIFT_CLOSED_TEXT = ('iPhone will not move AirTraffic files into the carrier catalog: Apple closed '
+                       'this carrier-setting method on this iOS build; retrying will not help. The installed '
+                       'profile remains.')
 # 27.2 betas are 24B5xxx: beta 1 24B5084k and beta 2 24B5089g still moved assets, beta 3 24B5099f refuses.
 AIRLIFT_FIRST_REFUSING_BETA = 5099
 
@@ -611,7 +632,7 @@ class AirliftClosed(RuntimeError):
     pass
 
 
-async def transfer(device, run, payload=None, expected=None, recovery=False):
+async def transfer(device, run, payload=None, expected=None, recovery=False, before_commit=None):
     from pymobiledevice3.services.afc import AfcService
     run.mkdir(parents=True, exist_ok=False)
     token = os.urandom(10).hex()
@@ -682,15 +703,17 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                     phase('recovery-final-authorized')
                     return
                 require(node and node['st_ifmt'] == 'S_IFDIR',
-                        'iPhone не отдал текущие настройки оператора. Не повторяйте установку: '+recover_hint()+'.')
+                        'iPhone did not export the current carrier catalog. Do not retry installation: '+recover_hint()+'.')
                 phase('original-exported')
                 snapshot = await remote_tree(afc, exported)
                 write_tree_zip(run / 'original.zip', snapshot)
                 phase('backup-saved', original_hash=tree_hash(snapshot))
                 if expected is not None:
                     # expected: the exact catalog, or a check for when only part of it is known.
-                    require(expected(snapshot) if callable(expected) else snapshot == expected, 'Настройки оператора на iPhone изменились во время операции. Запись отменена: '+recover_hint()+'.')
+                    require(expected(snapshot) if callable(expected) else snapshot == expected, 'The iPhone carrier catalog changed during the operation. Write cancelled: '+recover_hint()+'.')
                 require(await remote_tree(afc, exported) == snapshot, 'Export changed after backup')
+                if before_commit is not None:
+                    await before_commit()
                 phase('final-authorized')
             phase('host-started')
             try:
@@ -714,8 +737,8 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                     and airlift_refused(run / 'device.log', source)):
                 # Refused before the export arrived: the catalog never left its place.
                 untouched = journal['phase'] in ('created', 'staging', 'host-started', 'export-check')
-                raise AirliftClosed(AIRLIFT_CLOSED_TEXT + (' Каталог операторов на iPhone не менялся.' if untouched else '')
-                                    + ' Ошибка: ' + error_text(error)) from error
+                raise AirliftClosed(AIRLIFT_CLOSED_TEXT + (' The iPhone carrier catalog was not changed.' if untouched else '')
+                                    + ' Error: ' + error_text(error)) from error
             raise
         finally:
             if mutated:
@@ -730,8 +753,8 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
                     journal['books_restore_error'] = error_text(e)
                     save_json(run / 'journal.json', journal)
                     if journal.get('complete'):
-                        raise RuntimeError('Каталог операторов записан и проверен, не удалось только вернуть '
-                                           'служебные файлы Books: ' + error_text(e)) from e
+                        raise RuntimeError('Carrier catalog written and verified; only restoration of '
+                                           'Books sync files failed: ' + error_text(e)) from e
                     raise
                 save_json(run / 'journal.json', journal)
     # Remote originals and staging identifiers are intentionally retained for recovery.
@@ -778,12 +801,12 @@ async def cloud_backup(device):
 def backup_warning(backup, now=None):
     if not backup:
         return None
-    text = '  Включена резервная копия iCloud'
+    text = '  iCloud Backup is enabled'
     if backup.get('last'):
         hours = ((now or datetime.now().astimezone()) - datetime.fromisoformat(backup['last'])).total_seconds() / 3600
-        text += f' (последняя {hours:.0f} ч назад)' if hours >= 1 else ' (последняя меньше часа назад)'
-    return (text + '. Держите iPhone разблокированным до конца операции: на зарядке '
-            'с погасшим экраном iOS может начать копию и переписать служебные файлы Books.')
+        text += f' (last backup {hours:.0f} hours ago)' if hours >= 1 else ' (last backup less than an hour ago)'
+    return (text + '. Keep the iPhone unlocked until the operation finishes: while charging '
+            'with its screen off, iOS may start a backup and rewrite Books sync files.')
 
 
 async def device_info(device):
@@ -810,8 +833,8 @@ def no_cellular_sim(info, rows):
     if DEVICE_FAMILY != 'iPad' or rows:
         return None
     if info.get('TelephonyCapability') is False:
-        return 'Это iPad Wi-Fi без сотового модема. Установка профилей операторов недоступна.'
-    return 'iPad не сообщил активную SIM или eSIM. Включите сотовую линию и повторите проверку.'
+        return 'This is a Wi-Fi-only iPad without a cellular modem. Carrier profiles are unavailable.'
+    return 'iPad reported no active SIM or eSIM. Enable a cellular line and try again.'
 
 
 def check_trigger(path, sims, targets=(BUNDLE,)):
@@ -823,7 +846,7 @@ def check_trigger(path, sims, targets=(BUNDLE,)):
     name = bundles.pop()
     inner = {n.removeprefix('Payload/'): v for n, v in tree.items() if n.startswith('Payload/')}
     info, carrier = bundle_info(inner, name)
-    require(name not in targets, 'Триггер совпадает с устанавливаемым профилем '+name+'; нужен другой IPCC')
+    require(name not in targets, 'Trigger matches the target profile '+name+'; choose a different IPCC')
     require(info.get('CFBundleIdentifier') != 'com.apple.Viva_kw', 'Viva is not an independent trigger')
     identifiers = carrier.get('SupportedSIMs', [])
     require(identifiers and all(isinstance(s, str) and re.fullmatch(r'\d{5,6}(?:_.*)?', s) for s in identifiers),
@@ -851,16 +874,17 @@ async def install_trigger(device, path, run):
                         await afc_client.set_file_contents(target, z.read(entry))
     status = {'ipcc_installation_completed': False, 'log_error': None, 'nr_data_verified': False}
     try:
-        async with syslog_capture(device, run / 'commcenter.log', lambda line: 'CommCenter' in line, status, linger=0):
+        async with syslog_capture(device, run / 'commcenter.log', lambda line: 'CommCenter' in line,
+                                  status, linger=0, unified=True):
             try:
                 async with Installer(device) as installer:
                     await asyncio.wait_for(installer.install_from_local(path), 90)
             except Exception as error:
                 if 'InstallProhibited' in f'{type(error).__name__} {error}':
-                    raise RuntimeError('iPhone запрещает установку (InstallProhibited). Проверьте «Настройки → '
-                                       'Экранное время → Ограничения контента и конфиденциальности → Покупки '
-                                       'в iTunes Store и App Store → Установка приложений: Да» и профили '
-                                       'управления (MDM). Ничего на телефоне не изменено.') from error
+                    raise RuntimeError('iPhone prohibits installation (InstallProhibited). Check Settings → '
+                                       'Screen Time → Content & Privacy Restrictions → '
+                                       'iTunes & App Store Purchases → Installing Apps: Allow, and device '
+                                       'management (MDM) profiles. Nothing on the phone was changed.') from error
                 raise
             status['ipcc_installation_completed'] = True
             save_json(run / 'installation.json', status)
@@ -885,15 +909,15 @@ ASSET_SHA256 = '3b47408c5d2deb941d8b94c64724f5b72357dc39911ec9e77b7e4b3ccfb8659f
 
 def error_text(error):
     # TimeoutError and pymobiledevice3's connection errors often carry no message;
-    # never print or store a bare "Ошибка:". Unknown empty errors fall back to the type name.
+    # Never print or store a bare "Error:". Empty errors fall back to the type name.
     text = str(error).strip()
     if text: return text
-    if isinstance(error, TimeoutError): return 'время ожидания истекло'
+    if isinstance(error, TimeoutError): return 'timed out'
     connection = (ConnectionError,)
     with contextlib.suppress(Exception):  # a broken install must not hide the real error behind ImportError
         from pymobiledevice3 import exceptions as errors
         connection += (errors.ConnectionTerminatedError, errors.ConnectionFailedError)
-    if isinstance(error, connection): return 'связь с iPhone оборвалась'
+    if isinstance(error, connection): return 'connection to the iPhone was lost'
     return type(error).__name__
 
 
@@ -904,14 +928,14 @@ def error_line(error):
 
 
 def backend_error(error, platform_name=None):
-    text = 'AirTraffic backend недоступен: ' + str(error)
+    text = 'AirTraffic backend unavailable: ' + str(error)
     if (platform_name or sys.platform) == 'win32' and '.dll' in str(error).lower():
-        text += ('\n\nПричина: не удалось найти или загрузить библиотеки Apple для AirTraffic. '
-                 'Установка компонентов iTunes может быть неполной или несовместимой.'
-                 '\nУдалите iTunes и установите его по ссылке ниже:'
+        text += ('\n\nCause: Apple AirTraffic libraries could not be found or loaded. '
+                 'iTunes components may be incomplete or incompatible.'
+                 '\nRemove iTunes and reinstall it from the link below:'
                  '\nhttps://4pda.to/forum/index.php?showtopic=554020&st=3760#entry107393362'
-                 '\nЕсли скачивание на 4PDA выдаёт ошибку 404, нужна регистрация, вход в аккаунт и некоторая активность на форуме.'
-                 '\nПосле установки перезагрузите компьютер и повторите запуск CarrierSIM.')
+                 '\nA 404 on 4PDA requires registration, sign-in and some forum activity.'
+                 '\nAfter installation, restart the computer and run CarrierSIM again.')
     return text
 
 
@@ -925,13 +949,13 @@ def host_backend(platform_name=None):
         return 'apple'
     if platform_name.startswith('linux'):
         return 'linux-native-atc'
-    raise RuntimeError('Поддерживаются macOS, Windows и Linux.')
+    raise RuntimeError('macOS, Windows and Linux are supported.')
 
 
 def host_worker(config):
     if host_backend() == 'apple':
         if config.get('probe'):
-            raise RuntimeError('--atc-probe доступен только на Linux')
+            raise RuntimeError('--atc-probe is available only on Linux')
         from airtraffic_apple import run_worker
         return run_worker(config.get('udid'), config.get('assets', []), config.get('directories', []), framed)
     from airtraffic_native import run_worker
@@ -939,11 +963,11 @@ def host_worker(config):
                                   config.get('connection', 'USB'), framed, config.get('probe', False)))
 
 
-LOCAL_NETWORK_HINT = ('Похоже, macOS не пускает этот терминал в локальную сеть: iPhone по Wi-Fi отклонил '
-    'соединение мгновенно, а AirTraffic соединяется с ним напрямую. Разрешите терминалу доступ: «Системные настройки → Конфиденциальность и безопасность → '
-    'Локальная сеть». Из tmux, screen или SSH macOS разрешения не спрашивает: запустите «Запуск macOS.command» '
-    '(в готовой сборке — CarrierSIM) из Finder или обычное окно терминала, либо подключите кабель и переключите связь на кабель (пункт 10). '
-    'Если разрешение уже есть, проверьте, что iPhone в той же сети Wi-Fi и не спит')
+LOCAL_NETWORK_HINT = ('macOS appears to deny this terminal Local Network access: the iPhone rejected its Wi-Fi '
+    'connection immediately, and AirTraffic connects directly. Allow access in System Settings → Privacy & Security → '
+    'Local Network. macOS does not prompt from tmux, screen or SSH: launch Launch macOS.command '
+    '(or CarrierSIM in a packaged build) from Finder or a regular terminal, or connect USB and switch transport to USB (menu item 10). '
+    'If already permitted, ensure the iPhone is awake and on the same Wi-Fi network')
 
 
 class LocalNetworkDenied(RuntimeError):
@@ -958,8 +982,8 @@ LOCAL_NETWORK_WAIT = 20
 async def require_local_network(udid):
     # Only AirTraffic needs it: installs, and rollbacks that write the catalog back. Books goes through AFC.
     if CONNECTION!='Network' or not await asyncio.to_thread(local_network_denied,udid): return
-    print(f'Похоже, macOS не пускает терминал в локальную сеть. Если появилось окно «Локальная сеть», '
-          f'нажмите «Разрешить». Жду до {LOCAL_NETWORK_WAIT} с…',flush=True)
+    print(f'macOS appears to deny Local Network access. If the Local Network alert appears, '
+          f'choose Allow. Waiting up to {LOCAL_NETWORK_WAIT} s…',flush=True)
     for _ in range(LOCAL_NETWORK_WAIT):
         await asyncio.sleep(1)
         if not await asyncio.to_thread(local_network_denied,udid): return
@@ -982,7 +1006,7 @@ def usbmux_network_address(udid):
         def read(n):
             data = b''
             while len(data) < n:
-                chunk = s.recv(n - len(data)); require(chunk, 'usbmuxd закрыл соединение')
+                chunk = s.recv(n - len(data)); require(chunk, 'usbmuxd closed the connection')
                 data += chunk
             return data
         devices = plistlib.loads(read(struct.unpack('<I', read(16)[:4])[0] - 16)).get('DeviceList', [])
@@ -1048,25 +1072,25 @@ async def host_session(udid, assets, callback, run):
                     if not line.startswith(b'CARRIER_SWAP_JSON:'): continue
                     row = json.loads(line[len(b'CARRIER_SWAP_JSON:'):])
                     if row.get('event') == 'before-final-asset':
-                        require(not paused, 'Повторная пауза AirTraffic')
+                        require(not paused, 'Duplicate AirTraffic pause')
                         await callback(); paused = True
                         proc.stdin.write(b'CONTINUE\n'); await proc.stdin.drain()
                     elif 'ok' in row: result = row
                 code = await proc.wait()
-        detail = (result or {}).get('error') or ('код ' + str(code))
-        require(code == 0 and paused and result and result.get('ok'), 'Сбой AirTraffic: ' + str(detail))
+        detail = (result or {}).get('error') or ('code ' + str(code))
+        require(code == 0 and paused and result and result.get('ok'), 'AirTraffic failure: ' + str(detail))
     except TimeoutError:
         if not deadline.expired(): raise  # a timeout inside the pause (Books, AFC) keeps its own cause
         if not heard and CONNECTION == 'Network':
-            # Seen on Wi-Fi: the host never reached atc, attempt after attempt. Without "Сбой AirTraffic"
+            # Seen on Wi-Fi: the host never reached atc, attempt after attempt. Without "AirTraffic failed"
             # the error is not transient: the stage is rolled back once and no retry wastes minutes.
-            hint = (' Частая причина на macOS: терминалу не разрешена «Локальная сеть» (Системные настройки → '
-                    'Конфиденциальность и безопасность), в tmux, screen и SSH её не бывает.' if sys.platform == 'darwin' else '')
-            raise RuntimeError(f'AirTraffic не ответил по Wi-Fi за {AIRTRAFFIC_SECONDS} с.{hint} Подключите кабель, '
-                               'переключите связь на кабель (пункт 10) и повторите') from None
-        # "Сбой AirTraffic" keeps it transient: the usual rollback and retry follow.
-        raise RuntimeError('Сбой AirTraffic: ' + ('AirTraffic не ответил' if not heard else
-                           'синхронизация не завершилась') + f' за {AIRTRAFFIC_SECONDS} с') from None
+            hint = (' A common macOS cause is missing Local Network permission (System Settings → '
+                    'Privacy & Security); tmux, screen and SSH cannot prompt for it.' if sys.platform == 'darwin' else '')
+            raise RuntimeError(f'AirTraffic did not respond over Wi-Fi within {AIRTRAFFIC_SECONDS} s.{hint} Connect USB, '
+                               'switch transport to USB (menu item 10) and try again') from None
+        # "AirTraffic failure" keeps it transient: the usual rollback and retry follow.
+        raise RuntimeError('AirTraffic failure: ' + ('AirTraffic did not respond' if not heard else
+                           'sync did not finish') + f' within {AIRTRAFFIC_SECONDS} s') from None
     finally:
         if proc.returncode is None:
             proc.kill(); await proc.wait()
@@ -1079,13 +1103,13 @@ SYSTEM_PREFIX = '../../../../../../' + SYSTEM_BUNDLE_DIR + '/'
 
 def load_assets():
     path = ROOT/'assets.zip'
-    require(digest(path.read_bytes()) == ASSET_SHA256, 'Архив assets.zip повреждён или заменён.')
+    require(digest(path.read_bytes()) == ASSET_SHA256, 'assets.zip is damaged or has been replaced.')
     tree = read_tree_zip(path)
     return tree
 
 
 def bundle_link(name):
-    require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle', name), 'Неверное имя пакета: '+name)
+    require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle', name), 'Invalid bundle name: '+name)
     return ('l', (SYSTEM_PREFIX+name).encode())
 
 
@@ -1108,10 +1132,10 @@ def load_bundle_config(path=CONFIG):
             line = raw.split('#', 1)[0].strip()
             if not line: continue
             match = re.fullmatch(r'["\']?(default|\d{5,6})["\']?\s*:\s*["\']?([A-Za-z0-9_]+?)(?:\.bundle)?["\']?', line)
-            require(match, f'{path.name}, строка {number}: ожидается «default: Vodafone_hu» или «25001: Vodafone_ro» '
-                           '(MCCMNC без пробела, имя пакета латиницей).')
+            require(match, f'{path.name}, line {number}: expected default: Vodafone_hu or 25001: Vodafone_ro '
+                           '(MCCMNC without spaces; ASCII bundle name).')
             key, name = match.groups()
-            require(key not in config, f'{path.name}, строка {number}: {key} указан дважды.')
+            require(key not in config, f'{path.name}, line {number}: duplicate key {key}.')
             config[key] = name + '.bundle'
     config.setdefault('default', BUNDLE)
     return config
@@ -1182,7 +1206,7 @@ def catalog_name_error(name, catalog):
     name = name.removesuffix('.bundle')
     if not catalog or name in catalog['bundles']: return None
     same = [b for b in catalog['bundles'] if b.lower() == name.lower()]
-    return same and f'Пакета {name} нет, но есть {same[0]}: регистр букв важен. Укажите {same[0]}.'
+    return same and f'Bundle {name} not found, but {same[0]} exists: names are case-sensitive. Use {same[0]}.'
 
 
 def passport_lines(name, catalog):
@@ -1193,36 +1217,36 @@ def passport_lines(name, catalog):
     if r is None:
         import difflib
         near = difflib.get_close_matches(name, catalog['bundles'], 3, 0.6)
-        return [f'  {name}: нет в таблице пакетов ({where}); в вашей iOS пакет может быть или не быть.'
-                + (' Похожие: ' + ', '.join(near) + '.' if near else '')]
-    yn = lambda v, unset='не задано': 'да' if v is True else 'нет' if v is False else unset
-    pref = lambda v: {'wifi': 'Wi-Fi', 'ims': 'Wi-Fi', 'cellular': 'сотовая'}.get(v, 'не задан')
+        return [f'  {name}: not in the bundle catalog ({where}); it may or may not exist on your iOS build.'
+                + (' Similar: ' + ', '.join(near) + '.' if near else '')]
+    yn = lambda v, unset='not specified': 'yes' if v is True else 'no' if v is False else unset
+    pref = lambda v: {'wifi': 'Wi-Fi', 'ims': 'Wi-Fi', 'cellular': 'cellular'}.get(v, 'not specified')
     reg = str(r.get('reg') or '')
     # International: an exit prefix (+, 00, 011) and a full number; anything else is local to the bundle's country.
-    imessage = ('международный номер' if re.fullmatch(r'(?:\+|00|011)\d{7,}', reg) else
-                f'местный номер {reg} другой страны: из российской сети недоступен, повторная активация '
-                'по номеру может не пройти' if reg else 'номер не задан')
+    imessage = ('international number' if re.fullmatch(r'(?:\+|00|011)\d{7,}', reg) else
+                f'local number {reg} in another country: unreachable from Russian networks; phone-number '
+                'reactivation may fail' if reg else 'number not specified')
     lines = [f"  {name} · {r.get('country') or '?'}",
-             "    Источник: https://ios-bundles.github.io/",
-             f"    VoWiFi: приоритет дома — {pref(r.get('ih'))}, в роуминге — {yn(r.get('wroam'))}"
-             + (f", подпись «{r['wn']}»" if r.get('wn') else ''),
+             "    Source: https://ios-bundles.github.io/",
+             f"    VoWiFi: home preference — {pref(r.get('ih'))}, roaming — {yn(r.get('wroam'))}"
+             + (f", label «{r['wn']}»" if r.get('wn') else ''),
              f"    iMessage/FaceTime: {imessage}",
-             f"    Значок: {r.get('lte') or 'LTE'} · переключатель VoLTE: {'нет' if r.get('vs') is False else 'есть'}",
-             f"    5G: {'скрыт' if r.get('sw5g') is False else 'есть'} · EVS: {'есть' if r.get('evs') else 'нет'}"
-             f" · доп. услуги по IMS (XCAP): {yn(r.get('xcap'))}"]
+             f"    Icon: {r.get('lte') or 'LTE'} · VoLTE switch: {'no' if r.get('vs') is False else 'available'}",
+             f"    5G: {'hidden' if r.get('sw5g') is False else 'available'} · EVS: {'available' if r.get('evs') else 'no'}"
+             f" · supplementary IMS services (XCAP): {yn(r.get('xcap'))}"]
     if r.get('vvm') and r.get('vvm') != 'none':
-        lines.append(f"    визуальная голосовая почта: служебные SMS уходят на номер {r.get('beacon') or 'чужого оператора'}")
+        lines.append(f"    visual voicemail: service SMS sent to {r.get('beacon') or 'another carrier'}")
     return lines
 
 
-OPERATORS = {'232-05': 'One', '250-01': 'МТС', '250-02': 'МегаФон', '250-11': 'Yota', '250-20': 'T2',
-             '250-99': 'Билайн', '257-01': 'A1', '257-02': 'МТС BY', '257-04': 'life:)'}
+OPERATORS = {'232-05': 'One', '250-01': 'MTS', '250-02': 'MegaFon', '250-11': 'Yota', '250-20': 'T2',
+             '250-99': 'Beeline', '257-01': 'A1', '257-02': 'MTS BY', '257-04': 'life:)'}
 
 
 def mask_phone(phone):
     clean = re.sub(r'[^\d+]', '', phone) if isinstance(phone, str) else ''
     if not clean.startswith('+') or len(clean) < 8:
-        return 'номер недоступен'
+        return 'number unavailable'
     code = 2 if clean.startswith(('+7', '+1')) else 4 if clean.startswith(
         ('+375', '+992', '+993', '+994', '+995', '+996', '+998')) else 3
     return f'{clean[:code]} ••• •••{clean[-4:]}'
@@ -1237,14 +1261,14 @@ def sim_line(row, top):
     tray_empty = 'Absent' in str(top.get('SIMTrayStatus', ''))
     embedded = top.get('SIM1IsEmbedded') if slot == 'kOne' else None
     kind = ('eSIM' if embedded or (embedded is None and tray_empty) else
-            'физ. SIM' if embedded is False else 'тип неизвестен')
+            'physical SIM' if embedded is False else 'type unknown')
     iccid = str(row.get('IntegratedCircuitCardIdentity', ''))
     # Lockdown reports the phone number of one line only; show it for the SIM it belongs to.
     phone = (mask_phone(top.get('PhoneNumber')) if iccid and iccid == str(top.get('IntegratedCircuitCardIdentity', ''))
-             else 'номер недоступен')
-    current = str(row.get('CFBundleIdentifier', '')).removeprefix('com.apple.') or 'неизвестно'
+             else 'number unavailable')
+    current = str(row.get('CFBundleIdentifier', '')).removeprefix('com.apple.') or 'unknown'
     return '  ·  '.join((SLOT_NAMES.get(slot, str(slot)), operator, kind,
-                         f'ICCID …{iccid[-4:]}' if len(iccid) >= 4 else 'ICCID недоступен', phone, 'сейчас: ' + current))
+                         f'ICCID …{iccid[-4:]}' if len(iccid) >= 4 else 'ICCID unavailable', phone, 'current: ' + current))
 
 
 def output_section(title):
@@ -1256,7 +1280,7 @@ def print_sim_plan(row, top, target):
     parts = sim_line(row, top).split('  ·  ')
     print('\n  ' + ' · '.join(parts[:3]), flush=True)
     print('    ' + ' · '.join(parts[3:5]), flush=True)
-    print(f'    {parts[5]}  →  план: {target}', flush=True)
+    print(f'    {parts[5]}  →  plan: {target}', flush=True)
 
 
 def select_sims(rows, config=None, slots=SLOT_CHOICES['all'], any_mcc=True, skipped=None, only_skipped_ok=False):
@@ -1265,31 +1289,31 @@ def select_sims(rows, config=None, slots=SLOT_CHOICES['all'], any_mcc=True, skip
     for row in rows:
         mcc, mnc = str(row.get('MCC','')), str(row.get('MNC',''))
         slot, imsi = row.get('Slot'), row.get('InternationalMobileSubscriberIdentity')
-        require(slot in ('kOne','kTwo') and slot not in seen_slots, 'Неоднозначные слоты SIM; запись отменена.')
+        require(slot in ('kOne','kTwo') and slot not in seen_slots, 'Ambiguous SIM slots; write cancelled.')
         seen_slots.add(slot)
         if slot not in slots: continue
         # An empty MCC (locked phone, line off) must not pass for a foreign SIM.
         require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc),
-                'iPhone не сообщил оператора SIM '+(mcc+mnc or SLOT_NAMES.get(slot,str(slot)))+
-                '. Включите линию и разблокируйте телефон.')
+                'iPhone did not report the carrier for SIM '+(mcc+mnc or SLOT_NAMES.get(slot,str(slot)))+
+                '. Enable the line and unlock the phone.')
         bundle = bundle_for(mcc+mnc, config or {}, any_mcc)
         if bundle is None:
             if skipped is not None: skipped.append(slot)
             continue
         require(re.fullmatch(r'\d{3}',mcc) and re.fullmatch(r'\d{2,3}',mnc) and isinstance(imsi,str) and
                 re.fullmatch(r'\d{15}',imsi) and imsi.startswith(mcc+mnc),
-                'iPhone не сообщил полный IMSI для SIM '+mcc+mnc+'. Включите линию и разблокируйте телефон.')
-        require(imsi not in seen_imsi, 'Один IMSI указан в двух слотах; запись отменена.')
+                'iPhone did not report a full IMSI for SIM '+mcc+mnc+'. Enable the line and unlock the phone.')
+        require(imsi not in seen_imsi, 'The same IMSI is reported in two slots; write cancelled.')
         seen_imsi.add(imsi)
         selected.append({'slot':slot,'plmn':mcc+mnc,'imsi':imsi,'bundle':bundle})
     missing = [SLOT_NAMES[s] for s in slots if s not in seen_slots]
-    require(len(slots) > 1 or not missing, missing and missing[0]+' не найдена в iPhone. Выберите другую SIM.')
-    # --status only reads: a phone with foreign SIMs alone still shows its plan ("не трогаю").
+    require(len(slots) > 1 or not missing, missing and missing[0]+' not found on the iPhone. Choose another SIM.')
+    # --status only reads: a phone with foreign SIMs alone still shows its skipped-SIM plan.
     if not selected and skipped and only_skipped_ok: return selected
     require(selected or skipped is None or not skipped,
-            'Нет SIM операторов России или Беларуси. Чтобы сменить профиль зарубежной SIM, добавьте её MCCMNC '
-            'в bundle.yaml или выберите эту SIM в пункте 7 (флаг --sims 1 или 2).')
-    require(selected, 'Телефон не сообщил ни одной SIM с доступным IMSI.')
+            'No Russian or Belarusian carrier SIMs found. To change a foreign SIM profile, add its MCCMNC '
+            'to bundle.yaml or choose it in menu item 7 (--sims 1 or 2).')
+    require(selected, 'The phone reported no SIM with an available IMSI.')
     return selected
 
 
@@ -1298,7 +1322,7 @@ def make_plan(original, sims):
     # Signed system bundles match the phone's own firmware; only exact IMSI aliases change.
     for sim in sims:
         n = sim['imsi']
-        require(n not in original or original[n][0]=='l', 'Вместо ссылки IMSI обнаружен файл или каталог.')
+        require(n not in original or original[n][0]=='l', 'Found a file or directory in place of an IMSI symlink.')
         desired[n] = bundle_link(sim['bundle'])
     validate_tree(desired)
     return desired
@@ -1329,17 +1353,17 @@ async def choose_device(udid, wait_seconds=180):
         except (OSError, ConnectionError, ConnectionFailedToUsbmuxdError, NoDeviceConnectedError):devices=[]
         if udid and udid in devices:return udid
         if not udid and len(devices)==1:return devices[0]
-        require(udid or len(devices)<2,'Подключено несколько iPhone. Укажите --udid.')
+        require(udid or len(devices)<2,'Multiple iPhones connected. Specify --udid.')
         if not announced:
-            print('Ожидаю iPhone по Wi-Fi. Телефон и компьютер должны быть в одной сети, iPhone разблокирован…'
-                  if CONNECTION=='Network' else 'Ожидаю подключения iPhone по USB. Подключите и разблокируйте телефон…',flush=True)
+            print('Waiting for the iPhone over Wi-Fi. Keep it unlocked and on the same network as the computer…'
+                  if CONNECTION=='Network' else 'Waiting for the iPhone over USB. Connect and unlock it…',flush=True)
             announced=True
-        require(time.monotonic()<deadline,'Время ожидания подключения истекло. '+
-                ('iPhone не виден по Wi-Fi: один раз подключите его кабелем и включите в Finder/iTunes '
-                 '«Показывать этот iPhone, если он подключён к Wi-Fi», затем повторите с --wifi.' if CONNECTION=='Network' else
-                 'Проверьте кабель и повторите.')+
-                (' Если iPhone виден в Проводнике, но не в iTunes, не установлен драйвер Apple Mobile '
-                 'Device USB: см. раздел «Windows не видит iPhone» в README.' if sys.platform=='win32' and CONNECTION=='USB' else ''))
+        require(time.monotonic()<deadline,'Connection wait timed out. '+
+                ('iPhone not visible over Wi-Fi: connect USB once and enable in Finder/iTunes '
+                 'Show this iPhone when on Wi-Fi, then try --wifi again.' if CONNECTION=='Network' else
+                 'Check the cable and try again.')+
+                (' If iPhone appears in Explorer but not iTunes, the Apple Mobile '
+                 'Device USB driver is missing: see the Windows cannot see iPhone section in README.' if sys.platform=='win32' and CONNECTION=='USB' else ''))
         await asyncio.sleep(min(2,max(0,deadline-time.monotonic())))
 
 
@@ -1357,8 +1381,8 @@ async def ready_device(udid, wait_seconds):
                 await device.close()
                 unpaired+=1
                 require(unpaired<3 and time.monotonic()<deadline,
-                        'Нет доверия с этим компьютером. Подключите iPhone кабелем, запустите без --wifi '
-                        'и нажмите «Доверять», затем повторите с --wifi.')
+                        'This computer is not trusted. Connect USB, run without --wifi '
+                        'and tap Trust, then try --wifi again.')
                 await asyncio.sleep(2)
                 continue
             if not device.paired:
@@ -1366,25 +1390,25 @@ async def ready_device(udid, wait_seconds):
                 # pymobiledevice3 saves the new record to usbmuxd too, so Apple's AirTrafficHost can use it.
                 try:
                     if not asked:
-                        print('На iPhone появится запрос «Доверять этому компьютеру?». '
-                              'Нажмите «Доверять» и введите код-пароль.',flush=True)
+                        print('The iPhone will ask Trust This Computer? '
+                              'Tap Trust and enter your passcode.',flush=True)
                         asked=True
                     await device.pair(timeout=max(1,deadline-time.monotonic()))
-                    require(await device.validate_pairing(),'Не удалось установить доверие с iPhone. Отключите кабель и повторите.')
+                    require(await device.validate_pairing(),'Pairing failed. Disconnect the cable and try again.')
                 except errors.UserDeniedPairingError:
                     await device.close()
-                    raise RuntimeError('На iPhone выбрано «Не доверять». Отключите и снова подключите кабель, '
-                                       'затем нажмите «Доверять».') from None
+                    raise RuntimeError('Do Not Trust was selected on the iPhone. Reconnect the cable, '
+                                       'then tap Trust.') from None
                 except BaseException:
                     await device.close();raise
             return device
         except (OSError, errors.ConnectionTerminatedError, errors.PasswordRequiredError,
                 errors.NotPairedError, errors.PairingDialogResponsePendingError,
                 errors.ConnectionFailedError, errors.InvalidConnectionError) as error:
-            if last is None:print('Ожидаю разблокировки, доверия и готовности '+
-                                  ('соединения по Wi-Fi…' if CONNECTION=='Network' else 'USB-соединения…'),flush=True)
+            if last is None:print('Waiting for unlock, trust and a ready '+
+                                  ('Wi-Fi connection…' if CONNECTION=='Network' else 'USB connection…'),flush=True)
             last=error
-            if time.monotonic()>=deadline:raise RuntimeError('iPhone не готов: разблокируйте и подтвердите доверие.') from error
+            if time.monotonic()>=deadline:raise RuntimeError('iPhone not ready: unlock it and confirm trust.') from error
             await asyncio.sleep(2)
 
 
@@ -1399,7 +1423,7 @@ def transient_error(error):
     # The phone answering without our assets is deterministic: retrying only repeats it.
     if isinstance(error,(GrappaRefused,AirliftClosed)):return False
     return isinstance(error,RuntimeError) and any(t in str(error) for t in
-        ('Сбой AirTraffic','Final source not consumed')) and 'не подтвердил нужные объекты' not in str(error)
+        ('AirTraffic failure','Final source not consumed')) and 'did not confirm the required assets' not in str(error)
 
 
 async def auto_recover(args,failed,before):
@@ -1410,17 +1434,17 @@ async def auto_recover(args,failed,before):
         recovery.mkdir(mode=0o700); save_environment(recovery)
         try:
             await recover_all(device,failed,recovery)
-            print('iPhone возвращён в исходное состояние.',flush=True)
+            print('iPhone restored to its original state.',flush=True)
             return
         except Exception as error:
             if attempt==args.attempts or not transient_error(error):
-                print('Автовосстановление не завершено. Журнал:',recovery,flush=True)
-                print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
+                print('Automatic recovery is incomplete. Log:',recovery,flush=True)
+                print('Keep the runs folder and '+recover_hint()+'.',flush=True)
                 raise
-            print('Связь прервалась во время восстановления, повторяю…',flush=True)
+            print('Connection lost during recovery; retrying…',flush=True)
         except BaseException:
-            print('Автовосстановление не завершено. Журнал:',recovery,flush=True)
-            print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
+            print('Automatic recovery is incomplete. Log:',recovery,flush=True)
+            print('Keep the runs folder and '+recover_hint()+'.',flush=True)
             raise
         finally:await device.close()
         await asyncio.sleep(2)
@@ -1431,16 +1455,31 @@ async def auto_recover(args,failed,before):
 async def execute_with_retry(args,assets):
     # Once selected, reconnect only to this exact phone, even if a different phone appears.
     args.udid=await choose_device(args.udid,args.wait_seconds)
+    if (args.gid1 or args.undo_gid1 or args.tmobile_wholesale or args.remove_tmobile_wholesale):
+        # Catalog placement is single-shot; only interrupted verification reconnects.
+        return await execute_gid(args, assets)
     if args.diagnose or args.watch_call or args.report:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
+    active_gid = gid_active(args.runs, args.udid)
+    if active_gid and not args.status:
+        if args.recover:
+            for owner in reversed(gid_pending(args.runs, args.udid)):
+                require(CONNECTION == 'USB', 'GID crash recovery requires USB.')
+                recovery_args = argparse.Namespace(**vars(args))
+                recovery_args.gid1 = None
+                recovery_args.undo_gid1 = owner
+                await execute_gid(recovery_args, assets)
+        elif not args.restore_backup:
+            raise RuntimeError('A GID profile is installed or interrupted. Remove it explicitly before another write: '
+                               '--undo-gid1 ' + str(active_gid[0]))
     # Before any stage: an install needs AirTraffic. A rollback checks only before its AirTraffic
     # step (recover_stage): stages with only Books left go through AFC and need no direct connection.
     # An unfinished stage stops the install anyway (execute): say that first, not the permission.
     if CONNECTION=='Network' and not args.status and not args.recover and not pending(args.runs,args.udid):
         await require_local_network(args.udid)
     for attempt in range(1,args.attempts+1):
-        print(f'\n  Попытка {attempt} из {args.attempts}',flush=True)
+        print(f'\n  Attempt {attempt} of {args.attempts}',flush=True)
         before=set(pending(args.runs,args.udid))
         try:return await execute(args,assets)
         except Exception as error:
@@ -1450,11 +1489,578 @@ async def execute_with_retry(args,assets):
             # A denied Local Network would stop the auto-recovery's AirTraffic step the same way.
             failed=[] if args.status or isinstance(error,LocalNetworkDenied) else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
             if failed:
-                print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
+                print('Write failed. Restoring the iPhone to its original state first…',flush=True)
                 await auto_recover(args,failed,before)
             if attempt==args.attempts or not transient_error(error):raise
-            print('Повторяю попытку…',flush=True)
+            print('Retrying…',flush=True)
             await asyncio.sleep(2)
+
+
+# Experimental aliases live in the user catalog; system bundles remain untouched.
+GID_TERMINAL = {'undone', 'rolled_back', 'aborted'}
+TMOBILE_WHOLESALE = 'TMobile_Wholesale_US.bundle'
+
+
+def gid_connection_lost(error):
+    from pymobiledevice3 import exceptions as errors
+    return (isinstance(error, (ConnectionError, errors.ConnectionTerminatedError,
+                              errors.ConnectionFailedError, errors.InvalidConnectionError)) or
+            isinstance(error, OSError) and not isinstance(error, TimeoutError) and transient_error(error))
+
+
+def normalize_gid1(value):
+    value = value.strip()
+    if value.lower().startswith('0x'):
+        value = value[2:]
+    require(bool(re.fullmatch(r'[0-9a-fA-F]{2,32}', value)) and len(value) % 2 == 0,
+            'GID1 must contain 1–16 bytes of even-length hexadecimal.')
+    return value.upper()
+
+
+def gid_identities(rows):
+    result = {}
+    for row in rows:
+        slot = row.get('Slot')
+        plmn = str(row.get('MCC', '')) + str(row.get('MNC', ''))
+        imsi = row.get('InternationalMobileSubscriberIdentity', '')
+        iccid = row.get('IntegratedCircuitCardIdentity', '')
+        require(slot in SLOT_NAMES and slot not in result, 'Ambiguous active SIM slots.')
+        require(re.fullmatch(r'[0-9]{3}', str(row.get('MCC', ''))) and
+                re.fullmatch(r'[0-9]{2,3}', str(row.get('MNC', ''))) and
+                isinstance(imsi, str) and re.fullmatch(r'[0-9]{15}', imsi) and imsi.startswith(plmn) and
+                isinstance(iccid, str) and re.fullmatch(r'[0-9]{18,22}', iccid),
+                'Every active SIM must report a full, stable IMSI and ICCID; unlock the device.')
+        result[slot] = {'plmn': plmn, 'imsi_hash': digest(imsi.encode()), 'iccid_hash': digest(iccid.encode())}
+    require(len({v['imsi_hash'] for v in result.values()}) == len(result) and
+            len({v['iccid_hash'] for v in result.values()}) == len(result), 'Duplicate SIM identities.')
+    return result
+
+
+def gid_active(runs, udid):
+    return [p.parent for p in sorted(runs.glob('*/gid-alias.json'))
+            if (r := read_json(p)).get('udid_hash') == digest(udid.encode()) and r.get('state') not in GID_TERMINAL]
+
+
+def gid_healthy(record):
+    results = record.get('result', {})
+    complete = set(results) == set(record.get('identities', {}))
+    return (record.get('state') == 'applied_verified' and record.get('ownership_established') is True
+            and record.get('catalog_verified') is True and record.get('selection_verified') is True
+            and complete and bool(results) and all(result.get('verified') is True and
+                (not record.get('iccid_qualified') or result.get('operator', {}).get('verified') is True)
+                for result in results.values()))
+
+
+def gid_pending(runs, udid):
+    return [owner for owner in gid_active(runs, udid) if not gid_healthy(read_json(owner / 'gid-alias.json'))]
+
+
+def gid_print_undo(owner):
+    import shlex
+    command = [str(SELF), '--carrier'] if FROZEN else [sys.executable, str(SELF)]
+    command += ['--undo-gid1', str(owner)]
+    print('Explicit undo command:', flush=True)
+    print('  ' + (subprocess.list2cmdline(command) if os.name == 'nt' else shlex.join(command)), flush=True)
+
+
+def gid_noop(args, message, owner=None):
+    print(message, flush=True)
+    if owner is not None:
+        gid_print_undo(owner)
+    return NOTHING_TO_WRITE if args.status and os.environ.get('CARRIERSIM_PLAN') else 0
+
+
+def gid_wholesale_owners(args, device):
+    owners = []
+    for owner in gid_active(args.runs, device.udid):
+        saved = read_json(owner / 'gid-alias.json')
+        if (saved.get('bundle') == TMOBILE_WHOLESALE and saved.get('iccid_qualified')
+                and saved.get('ownership_established')
+                and saved.get('slot') in SLOT_CHOICES[args.sims]):
+            owners.append((owner, gid_record(owner, device)))
+    return owners
+
+
+def gid_wholesale_slot(rows, sims):
+    candidates = [row for row in rows if row['Slot'] in SLOT_CHOICES[sims] and
+                  row.get('CFBundleIdentifier') in ('com.apple.TMobile_MVNO_US', 'com.apple.TMobile_Wholesale_US')]
+    require(candidates, 'No eligible T-Mobile SIM was found. Automatic installation requires a reported '
+                       'TMobile_MVNO_US profile; other carriers are not changed.')
+    require(len(candidates) == 1, 'More than one eligible T-Mobile SIM was found. Select --sims 1 or --sims 2.')
+    return candidates[0]
+
+
+def gid_owned_tree(tree, record):
+    name = record['alias']
+    if not record.get('ownership_established'):
+        # A baseline/duplicate failure may predate proof that the alias was absent.
+        # Such a journal never owns a pre-existing entry, even with identical bytes.
+        return dict(tree)
+    written = ('l', bytes.fromhex(record['link_hex']))
+    require(name not in tree or tree[name] == written,
+            'The alias was changed by another operation; refusing to remove it.')
+    desired = dict(tree)
+    desired.pop(name, None)
+    return desired
+
+
+def gid_record(run, device):
+    record = read_json(run / 'gid-alias.json')
+    bound(record, device)
+    base_alias = record.get('plmn', '') + '_GID1-' + normalize_gid1(record.get('gid1', ''))
+    qualified = record.get('iccid_qualified', False)
+    require(isinstance(qualified, bool), 'Invalid ICCID qualifier binding.')
+    expected_alias = base_alias
+    if qualified:
+        alias = record.get('alias', '')
+        prefix = base_alias + '_ID-'
+        require(isinstance(alias, str) and alias.startswith(prefix), 'Invalid ICCID-qualified alias.')
+        iccid = alias[len(prefix):]
+        identity = record.get('identities', {}).get(record.get('slot'), {})
+        require(re.fullmatch(r'[0-9]{18,22}', iccid) and identity.get('plmn') == record.get('plmn') and
+                digest(iccid.encode()) == identity.get('iccid_hash'),
+                'The alias ICCID does not match the original selected SIM binding.')
+        LOG_SECRETS[iccid] = '<iccid>'
+        expected_alias += '_ID-' + iccid
+        if record.get('ownership_established'):
+            require(all(record.get('baseline', {}).get(slot, {}).get('operator', {}).get('verified')
+                        for slot in record.get('identities', {})),
+                    'The qualified alias has no verified operator baseline.')
+    require(record.get('schema') == 1 and record.get('kind') == 'gid1-alias' and
+            record.get('family') == DEVICE_FAMILY and record.get('alias_before') is None and
+            record.get('alias') == expected_alias, 'Invalid GID alias journal.')
+    require(not record.get('ownership_established') or record.get('before_hash'),
+            'Owned alias has no verified baseline backup.')
+    require(record.get('link_hex') == bundle_link(record.get('bundle', ''))[1].hex(),
+            'Saved alias bytes do not match the system bundle binding.')
+    if record.get('before_hash'):
+        baseline = read_tree_zip(run / 'snapshot' / 'original.zip')
+        require(tree_hash(baseline) == record['before_hash'] and record['alias'] not in baseline,
+                'The bound catalog backup is missing or damaged.')
+        stage = read_json(run / 'snapshot' / 'journal.json')
+        bound(stage, device)
+        require(stage.get('original_hash') == record['before_hash'], 'Wrong catalog backup.')
+        books = read_tree_zip(run / 'snapshot' / 'books.zip')
+        state = read_json(run / 'snapshot' / 'books.json')
+        require(tree_hash(books) == state.get('hash') == record.get('books_hash'), 'Wrong Books backup.')
+    return record
+
+
+def gid_selection(path, identities, installation, *, require_operator=False):
+    require(installation and installation.get('ipcc_installation_completed') and not installation.get('log_error')
+            and path.exists(), 'A fresh, complete CommCenter rescan log is required.')
+    results = {slot: {'slot': slot, 'plmn': identity['plmn'], 'expected': None,
+                      'selected': None, 'verified': False} for slot, identity in identities.items()}
+    # Unlike the normal report, every block for a slot must agree and verify.
+    text = path.read_text(encoding='utf-8', errors='replace')
+    require(text.strip(), 'No fresh CommCenter activity was captured.')
+    require(not identities or BUNDLE_BLOCK in text, 'The rescan log contains no observable bundle state.')
+    blocks = text.split(BUNDLE_BLOCK)
+    for result in results.values():
+        index = 1 if result['slot'] == 'kOne' else 2
+        for kind in ('Carrier', 'Operator') if require_operator else ('Carrier',):
+            observations = []
+            for block in blocks:
+                paths = re.findall(r'Resolved path\s*:\s*([^\r\n]+)', block)
+                links = re.findall(r'Linking Path\s*:\s*([^\r\n]+)', block)
+                verification = re.findall(r'Verification Result\s*:\s*([^\r\n]+)', block)
+                if any(link.strip() == PARENT + f'/BundleLinks/{kind}{index}Bundle.bundle' for link in links):
+                    require(len(paths) == len(links) == 1 and verification == ['Success'],
+                            f'Ambiguous or rejected {kind.lower()} slot selection.')
+                    resolved = paths[0].strip()
+                    leaf = resolved.rsplit('/', 1)[-1]
+                    require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle', leaf) and
+                            resolved == '/System/Library/Carrier Bundles/' + DEVICE_FAMILY + '/' + leaf,
+                            'The rescan did not resolve an untouched system carrier bundle.')
+                    observations.append(resolved)
+            require(observations and len(set(observations)) == 1,
+                    f'Missing or ambiguous {kind.lower()} slot selection.')
+            selection = dict(resolved=observations[0], selected=observations[0].rsplit('/', 1)[-1], verified=True)
+            if kind == 'Carrier':
+                result.update(selection)
+            else:
+                result['operator'] = selection
+    return results
+
+
+def gid_baseline_key(path, slot, alias=None, *, plmn=None):
+    # Name is visible when Best match URL and GID1 are private. Never infer a winner
+    # from scores or a resolved bundle name: require an actual chosen lookup.
+    text = path.read_text(encoding='utf-8', errors='replace')
+    index = 1 if slot == 'kOne' else 2
+    evidence = []
+    for section in text.split('Matching request kCarrier bundle')[1:]:
+        section = section.split('Matching response kCarrier bundle', 1)[0]
+        if not re.search(r'Linking Path\s*:\s*[^\r\n]*/Carrier' + str(index) + r'Bundle\.bundle', section):
+            continue
+        before = section.split(BUNDLE_BLOCK, 1)[0]
+        system, separator, user = before.partition('User Bundle Lookup')
+        require(separator, 'Missing fresh lookup-key evidence.')
+        if "No match in user's, choosing System match" in user:
+            chosen = system
+        elif re.search(r"choosing [Uu]ser(?:'s)? match", user):
+            chosen = user
+        else:
+            raise RuntimeError('The log does not expose an unambiguous chosen matching key.')
+        names = re.findall(r'Returning bundle match: Matches:.*', chosen)
+        keys = {name.strip().rsplit('/', 1)[-1] for line in names for name in
+                re.findall(r'\[Name:\s*([^,\]]+),', line) if name.strip()}
+        require(len(keys) == 1, 'Fresh baseline chose an ambiguous matching key.')
+        key = next(iter(keys))
+        if alias is not None:
+            require(key == alias, 'Fresh baseline chose a different matching key.')
+        else:
+            match = re.fullmatch(re.escape(plmn) + r'_GID1-([0-9A-F]{2,32})', key)
+            require(match is not None, 'The selected baseline is not a plain PLMN/GID1 key; automatic installation stopped.')
+            normalize_gid1(match[1])
+        evidence.append(key)
+    require(evidence and len(set(evidence)) == 1, 'No consistent chosen GID1 matching key was observed for the selected slot.')
+    return evidence[0]
+
+
+def gid_trigger(args, assets, run, info, identities, bundle):
+    plmns = {v['plmn'] for v in identities.values()}
+    candidates = [args.trigger] if args.trigger else []
+    if not args.trigger:
+        names = ('AVEA_tr_iPad.ipcc',) if DEVICE_FAMILY == 'iPad' else (
+            'AVEA_tr.ipcc', 'Swisscom_ch.ipcc', 'O2_Germany.ipcc')
+        for name in names:
+            if assets is not None and 'triggers/' + name in assets:
+                candidate = run / name
+                candidate.write_bytes(assets['triggers/' + name][1])
+                candidates.append(candidate)
+    for candidate in candidates:
+        try:
+            status = check_trigger(candidate, plmns, (bundle,))
+            if not check_trigger_hardware(candidate, info['HardwareModel'], warn=False):
+                continue
+        except RuntimeError:
+            if args.trigger:
+                raise
+            continue
+        target = run / 'gid-trigger.ipcc'
+        raw = candidate.read_bytes()
+        require(digest(raw) == status['sha256'], 'Trigger changed after validation.')
+        target.write_bytes(raw)
+        return target, status
+    raise RuntimeError('No independent, non-overlapping, board-signed rescan trigger is available.')
+
+
+class GidRescanConnectionError(RuntimeError):
+    """Catalog placement is known; a disconnected capture still needs fresh proof."""
+
+
+async def gid_rescan(device, trigger, work, name, identities, *, require_operator=False):
+    stage = work / name
+    stage.mkdir()
+    status = await install_trigger(device, trigger, stage)
+    if status.get('log_error') and status.get('log_interrupted'):
+        raise GidRescanConnectionError('The CommCenter verification stream lost its connection.')
+    results = gid_selection(stage / 'commcenter.log', identities, status, require_operator=require_operator)
+    save_json(stage / 'selection.json', results)
+    return results
+
+
+async def gid_checked_rescan(device, trigger, work, name, identities, record, reconnect, expected_catalog):
+    qualified = record.get('iccid_qualified', False)
+    try:
+        result = await gid_rescan(device, trigger, work, name, identities, require_operator=qualified)
+        require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed during verification.')
+        return result
+    except Exception as error:
+        if not isinstance(error, GidRescanConnectionError) and not gid_connection_lost(error):
+            raise
+        print('Carrier change interrupted the connection. Reconnecting to verify the existing catalog; no alias reapply.', flush=True)
+        record.setdefault('verification_connection_errors', []).append(error_line(error))
+        device = await reconnect()
+        require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed after reconnect.')
+        current = await transfer(device, work / (name + '-reconnect-catalog'))
+        require(current == expected_catalog, 'The catalog changed during reconnect; verification stopped.')
+        result = await gid_rescan(device, trigger, work, name + '-reconnected', identities, require_operator=qualified)
+        require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed during fresh verification.')
+        return result
+
+
+async def gid_repair_stages(device, owner, record, work, runs):
+    roots = {owner.resolve(), *(Path(p).resolve() for p in record.get('work_runs', []))}
+    stages = [p for p in pending(runs, device.udid) if p.parent.resolve() in roots]
+    if stages:
+        await recover_all(device, stages, work, alias_record=record)
+    require(not any(p.parent.resolve() in roots for p in pending(runs, device.udid)),
+            'Stage or Books recovery remains incomplete.')
+
+
+async def gid_remove(device, owner, record, work, trigger, runs, final_state, reconnect):
+    apply_journal = owner / 'apply' / 'journal.json'
+    if record.get('ownership_established') and apply_journal.exists():
+        applied = read_json(apply_journal)
+        bound(applied, device)
+        require(applied.get('payload_hash') == record.get('after_hash'), 'Wrong GID apply journal.')
+        if not applied.get('complete') and applied.get('phase') in (
+                'created', 'staging', 'host-started', 'export-check', 'original-exported', 'backup-saved'):
+            # A failed precommit guard proves our final asset was never authorized. An
+            # identical alias added by somebody else is not ours to remove.
+            record.update(ownership_established=False, apply_not_authorized=True)
+    record.update(state='rollback_required', recovery_run=str(work))
+    save_json(owner / 'gid-alias.json', record)
+    await gid_repair_stages(device, owner, record, work, runs)
+    current = await transfer(device, work / 'undo-snapshot')
+    desired = gid_owned_tree(current, record)
+    identities = gid_identities(await carrier_rows(device))
+    check_trigger(trigger, {v['plmn'] for v in identities.values()}, (record['bundle'],))
+    async def stable():
+        require(gid_identities(await carrier_rows(device)) == identities,
+                'Active SIM identities changed during undo; retry the journal-bound undo.')
+    if desired != current:
+        await transfer(device, work / 'undo', payload=desired, expected=current, before_commit=stable)
+    observed = await transfer(device, work / 'undo-readback')
+    require(observed == desired and (not record.get('ownership_established') or record['alias'] not in observed),
+            'Alias removal could not be verified.')
+    result = await gid_checked_rescan(device, trigger, work, 'undo-rescan', identities, record, reconnect, observed)
+    for slot, identity in identities.items():
+        baseline = record.get('baseline', {}).get(slot)
+        if record.get('ownership_established') and identity == record.get('identities', {}).get(slot) and baseline:
+            require(result[slot]['resolved'] == baseline['resolved'],
+                    'The original SIM has not returned to its verified baseline selection.')
+            if record.get('iccid_qualified'):
+                require(result[slot]['operator']['resolved'] == baseline['operator']['resolved'],
+                        'The original SIM has not returned to its verified operator baseline.')
+    require(not any(p.parent.resolve() == work.resolve() for p in pending(runs, device.udid)),
+            'Books or stage recovery is not verified.')
+    record.update(state=final_state if record.get('ownership_established') else 'aborted',
+                  alias_removed=record['alias'] not in observed, catalog_verified=True,
+                  rollback_verified=True, undo_result=result,
+                  undo_selection_status='verified' if identities else 'no_active_sims',
+                  finished_at=datetime.now(timezone.utc).isoformat())
+    save_json(owner / 'gid-alias.json', record)
+
+
+async def execute_gid(args, assets):
+    require(CONNECTION == 'USB', 'GID and T-Mobile Wholesale installation/removal require USB.')
+    device = await ready_device(args.udid, args.wait_seconds)
+    owner = work = record = None
+    trigger = None
+    mutations_started = False
+    automatic = args.tmobile_wholesale
+    undo = bool(args.undo_gid1 or args.remove_tmobile_wholesale)
+    try:
+        info = await device_info(device)
+        configure_device(info)
+        require(info.get('DeviceClass') in ('iPhone', 'iPad') and info.get('ActivationState') == 'Activated',
+                'An activated iPhone or cellular iPad is required.')
+        DIAG['info'] = info
+        print(f"Device: {info['ProductType']} · {info['HardwareModel']} · "
+              f"iOS {info['ProductVersion']} ({info['BuildVersion']})", flush=True)
+
+        async def reconnect():
+            nonlocal device
+            udid = args.udid
+            with contextlib.suppress(Exception):
+                await device.close()
+            device = await ready_device(udid, args.wait_seconds)
+            require(device.udid == udid, 'A different device appeared during reconnect.')
+            current_info = await device_info(device)
+            require(all(current_info.get(key) == info.get(key) for key in
+                        ('DeviceClass', 'ProductType', 'HardwareModel', 'BuildVersion', 'ActivationState')),
+                    'The device or iOS build changed during this operation.')
+            if record is not None:
+                bound(record, device)
+            return device
+
+        rows = await carrier_rows(device)
+        identities = gid_identities(rows)
+        if args.remove_tmobile_wholesale:
+            owners = gid_wholesale_owners(args, device)
+            if not owners:
+                return gid_noop(args, 'No owned ICCID-qualified T-Mobile Wholesale installation was found. Nothing was changed.')
+            require(len(owners) == 1, 'More than one owned Wholesale installation was found. Select --sims 1 or --sims 2, '
+                                     'or use --undo-gid1 with the specific run directory.')
+            owner, record = owners[0]
+        elif undo:
+            owner = args.undo_gid1.resolve()
+            record = gid_record(owner, device)
+        if undo:
+            print('Undo only the exact alias owned by:', owner, flush=True)
+            print('Alias:', mask_ids(record['alias']), '→', record['bundle'], flush=True)
+            print('The original SIM may be disabled or removed; current catalog changes are preserved.', flush=True)
+            if args.status:
+                print('Read-only preview. Owned-entry, catalog and recovery checks run on confirmed undo.', flush=True)
+                return 0
+            if record.get('state') == 'planning':
+                roots = {owner, *(Path(p).resolve() for p in record.get('work_runs', []))}
+                require(not record.get('ownership_established') and not record.get('baseline') and
+                        not any(p.parent.resolve() in roots for p in pending(args.runs, device.udid)),
+                        'A planning journal contains evidence of device changes; recovery stopped.')
+                record.update(state='aborted', finished_at=datetime.now(timezone.utc).isoformat())
+                save_json(owner / 'gid-alias.json', record)
+                print('Operation cancelled before device changes; no alias was committed.', flush=True)
+                return 0
+        else:
+            if automatic:
+                selected_row = gid_wholesale_slot(rows, args.sims)
+                slot = selected_row['Slot']
+                matching = [(path, saved) for path, saved in gid_wholesale_owners(args, device)
+                            if saved['identities'][saved['slot']] == identities[slot]]
+                require(len(matching) <= 1, 'Conflicting ownership journals exist for this SIM. Use explicit journal-bound undo.')
+                if matching:
+                    installed_owner, installed = matching[0]
+                    require(gid_healthy(installed), 'This SIM has an interrupted installation. Use --recover or explicit removal first.')
+                    require(selected_row['CFBundleIdentifier'] == 'com.apple.TMobile_Wholesale_US',
+                            'The owned installation is no longer reported as Wholesale. Remove it explicitly before reinstalling.')
+                    print('Recorded catalog and carrier/operator verification is intact; the phone currently reports Wholesale.\n'
+                          'No fresh catalog export or rescan was performed.', flush=True)
+                    return gid_noop(args, 'Already installed for this SIM. The installation was left unchanged.', installed_owner)
+                if selected_row['CFBundleIdentifier'] == 'com.apple.TMobile_Wholesale_US':
+                    return gid_noop(args, 'The phone already reports T-Mobile Wholesale without an owned installation. Nothing was changed.')
+                args.bundle = TMOBILE_WHOLESALE
+                iccid_qualified = True
+                base_alias = alias = None
+            else:
+                slot = SLOT_CHOICES[args.sims][0]
+                require(slot in identities, 'The explicitly selected SIM is not active.')
+                selected_row = next(row for row in rows if row['Slot'] == slot)
+                iccid_qualified = args.gid1_iccid
+                base_alias = identities[slot]['plmn'] + '_GID1-' + args.gid1
+                alias = base_alias
+            chosen = identities[slot]
+            require(not airlift_may_be_closed(info), 'This build is known to close AirLift; no installation will be attempted.')
+            require(all(s == slot or v['plmn'] != chosen['plmn'] for s, v in identities.items()),
+                    'Another active SIM has the same PLMN; GID overlap cannot safely be excluded.')
+            iccid = selected_row['IntegratedCircuitCardIdentity']
+            LOG_SECRETS[iccid] = '<iccid>'
+            if iccid_qualified and alias is not None:
+                alias += '_ID-' + iccid
+            require(gid_identities(await carrier_rows(device)) == identities, 'SIM identifiers are unstable.')
+            require(not gid_active(args.runs, device.udid), 'Remove the previous GID installation before applying another.')
+            require(not pending(args.runs, device.udid), 'Recover unfinished stages before applying a GID installation.')
+            print('Selected:', sim_header(selected_row), '· ICCID ending', iccid[-4:], flush=True)
+            if automatic:
+                print('Target:', TMOBILE_WHOLESALE, '· full ICCID qualification.\n'
+                      'The actual matched GID1 key will be discovered from a fresh verified stock baseline; no identifier is guessed.',
+                      flush=True)
+            else:
+                print('Experimental alias:', mask_ids(alias), '→', args.bundle, flush=True)
+                print('The qualifier uses this SIM’s full ICCID; carrier and operator selections must both verify.'
+                      if iccid_qualified else
+                      'The slot identifies the SIM for planning; a PLMN/GID rule is NOT isolated to that slot.', flush=True)
+                print('A fresh verified baseline must choose:', base_alias, '· Missing evidence stops safely.', flush=True)
+            if args.status:
+                print('Read-only preview: no trigger, catalog export, Books backup or write has occurred.', flush=True)
+                return 0
+        work = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'gid-' + uuid.uuid4().hex[:6])
+        work.mkdir(mode=0o700)
+        DIAG['run'] = work
+        save_environment(work)
+        if not undo:
+            plan = {'schema': 1, 'kind': 'gid1-alias', 'state': 'planning', 'target': TARGET,
+                    'udid_hash': digest(device.udid.encode()), 'family': DEVICE_FAMILY,
+                    'slot': slot, 'plmn': chosen['plmn'], 'gid1': args.gid1, 'alias': alias,
+                    'iccid_qualified': iccid_qualified, 'automatic_tmobile_wholesale': automatic,
+                    'bundle': args.bundle, 'alias_before': None, 'ownership_established': False,
+                    'link_hex': bundle_link(args.bundle)[1].hex(), 'identities': identities,
+                    'created_at': datetime.now(timezone.utc).isoformat(), 'work_runs': [str(work)]}
+            if not automatic:
+                owner, record = work, plan
+                save_json(owner / 'gid-alias.json', record)
+        if warning := backup_warning(await cloud_backup(device)):
+            print(warning, flush=True)
+        trigger, trigger_info = gid_trigger(args, assets, work, info, identities, record['bundle'] if undo else args.bundle)
+        baseline = None
+        if automatic:
+            # Discovery only installs an independently signed, non-overlapping trigger.
+            # Do not create an unrecoverable alias journal with an unknown GID1.
+            baseline = await gid_rescan(device, trigger, work, 'baseline', identities, require_operator=True)
+            require(gid_identities(await carrier_rows(device)) == identities, 'SIM changed during baseline discovery.')
+            stock = '/System/Library/Carrier Bundles/' + DEVICE_FAMILY + '/TMobile_MVNO_US.bundle'
+            require(baseline[slot]['operator']['resolved'] == stock and baseline[slot]['resolved'] == stock,
+                    'The fresh baseline is not the reported stock T-Mobile MVNO bundle.')
+            base_alias = gid_baseline_key(work / 'baseline' / 'commcenter.log', slot, plmn=chosen['plmn'])
+            args.gid1 = normalize_gid1(base_alias.split('_GID1-', 1)[1])
+            alias = base_alias + '_ID-' + iccid
+            print('Discovered matched GID1 key:', base_alias, '· not a raw EF GID1 read.', flush=True)
+            owner, record = work, plan
+            record.update(state='baseline_verified', gid1=args.gid1, alias=alias,
+                          baseline=baseline, baseline_key=base_alias)
+        if undo:
+            record.setdefault('work_runs', []).append(str(work))
+        record['trigger'] = trigger_info
+        save_json(owner / 'gid-alias.json', record)
+        if undo:
+            mutations_started = True
+            await gid_remove(device, owner, record, work, trigger, args.runs, 'undone', reconnect)
+            print('Owned GID alias removed; catalog and Books restoration verified.', flush=True)
+            print('Current slot selections verified.' if record['undo_selection_status'] == 'verified' else
+                  'No active SIMs: slot selection cannot be tested until a SIM is enabled.', flush=True)
+            return 0
+        if not automatic:
+            record['state'] = 'baseline_started'
+            save_json(owner / 'gid-alias.json', record)
+            mutations_started = True
+            baseline = await gid_rescan(device, trigger, work, 'baseline', identities, require_operator=iccid_qualified)
+            record['baseline'] = baseline
+            save_json(owner / 'gid-alias.json', record)
+            gid_baseline_key(work / 'baseline' / 'commcenter.log', slot, base_alias)
+        mutations_started = True
+        original = await transfer(device, work / 'snapshot')
+        require(original is not None and alias not in original, 'The alias already exists; refusing duplicate or conflicting ownership.')
+        require(gid_identities(await carrier_rows(device)) == identities, 'SIM changed before commit.')
+        desired = dict(original)
+        desired[alias] = bundle_link(args.bundle)
+        validate_tree(desired)
+        record.update(state='prepared', baseline=baseline, baseline_key=base_alias, ownership_established=True,
+                      before_hash=tree_hash(original), after_hash=tree_hash(desired),
+                      books_hash=read_json(work / 'snapshot' / 'books.json')['hash'])
+        save_json(owner / 'gid-alias.json', record)
+        async def stable():
+            require(gid_identities(await carrier_rows(device)) == identities, 'SIM changed before commit.')
+        # Intent precedes transfer: a crash after placement still requires scoped undo.
+        record['state'] = 'apply_started'
+        save_json(owner / 'gid-alias.json', record)
+        await transfer(device, work / 'apply', payload=desired, expected=original, before_commit=stable)
+        require(await transfer(device, work / 'readback') == desired, 'Applied catalog readback mismatch.')
+        result = await gid_checked_rescan(device, trigger, work, 'rescan', identities, record, reconnect, desired)
+        for current_slot in identities:
+            for kind in ('carrier', 'operator') if iccid_qualified else ('carrier',):
+                current = result[current_slot] if kind == 'carrier' else result[current_slot]['operator']
+                previous = baseline[current_slot] if kind == 'carrier' else baseline[current_slot]['operator']
+                expected = ('/System/Library/Carrier Bundles/' + DEVICE_FAMILY + '/' + args.bundle
+                            if current_slot == slot else previous['resolved'])
+                require(current['resolved'] == expected,
+                        f"SIM {1 if current_slot == 'kOne' else 2} {kind} selected {current['selected']}; "
+                        f"expected {expected.rsplit('/', 1)[-1]}.")
+        require(not any(p.parent == work for p in pending(args.runs, device.udid)), 'Books recovery is incomplete.')
+        record.update(state='applied_verified', result=result, catalog_verified=True, selection_verified=True,
+                      verified_at=datetime.now(timezone.utc).isoformat())
+        save_json(owner / 'gid-alias.json', record)
+        print('Catalog, selection and signature verification succeeded. The installation is left applied.\n'
+              'No background program is needed. iOS/carrier updates can replace the rule or close the write path.', flush=True)
+        gid_print_undo(owner)
+        return 0
+    except BaseException as error:
+        if record is not None and owner is not None and work is not None:
+            record.update(state='aborted' if not mutations_started and not undo else 'rollback_required',
+                          operation_error=error_line(error))
+            save_json(owner / 'gid-alias.json', record)
+            if record['state'] == 'aborted':
+                print('Operation stopped before device changes; no recovery is needed.', flush=True)
+            # Never repeat apply. Reconnect before scoped rollback so cleanup owns a live client.
+            if mutations_started and trigger is not None:
+                try:
+                    await reconnect()
+                    recovery = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'gid-rollback-' + uuid.uuid4().hex[:6])
+                    recovery.mkdir(mode=0o700)
+                    record['work_runs'].append(str(recovery))
+                    save_json(owner / 'gid-alias.json', record)
+                    await gid_remove(device, owner, record, recovery, trigger, args.runs,
+                                     'undone' if undo else 'rolled_back', reconnect)
+                    print('Scoped rollback verified; unrelated current catalog entries were preserved.', flush=True)
+                except BaseException as rollback_error:
+                    record.update(state='rollback_required', rollback_error=error_line(rollback_error))
+                    save_json(owner / 'gid-alias.json', record)
+                    print('Recovery is incomplete. Keep runs and use --undo-gid1 ' + str(owner), file=sys.stderr)
+        raise
+    finally:
+        await device.close()
 
 
 BUNDLE_BLOCK = '----------Bundle File----------'
@@ -1480,10 +2086,10 @@ def slot_outcome(result, ok):
     # One line per SIM after the rescan; the wording is what users paste into bug reports.
     expected = (result['expected'] or '').removesuffix('.bundle')
     selected = (result['selected'] or '').removesuffix('.bundle')
-    if ok: return (selected or 'штатный профиль') + ' — подпись принята'
-    if not selected: return 'в журнале пересканирования нет выбора пакета для этой SIM'
-    if expected and selected.lower() != expected.lower(): return f'iOS выбрала {selected} вместо {expected}'
-    return f'{selected} выбран, но подпись не принята'
+    if ok: return (selected or 'stock profile') + ' — signature accepted'
+    if not selected: return 'rescan log contains no bundle selection for this SIM'
+    if expected and selected.lower() != expected.lower(): return f'iOS selected {selected} instead of {expected}'
+    return f'{selected} selected, but signature rejected'
 
 
 def read_json(path):
@@ -1513,7 +2119,7 @@ def operation_lock(runs):
                 import fcntl
                 fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except OSError:
-            raise RuntimeError('Скрипт уже запущен в другом окне. Дождитесь его завершения или закройте его.') from None
+            raise RuntimeError('CarrierSIM is already running in another window. Wait for it to finish or close it.') from None
         try: yield
         finally:
             if sys.platform=='win32':
@@ -1522,24 +2128,32 @@ def operation_lock(runs):
 
 def bound(record,device):
     require(record.get('target')==TARGET and record.get('udid_hash')==digest(device.udid.encode()),
-            'Копия относится к другому телефону или каталогу.')
+            'Backup belongs to another device or catalog.')
 
 
 EXPORT_SETTLE_SECONDS = 60
 
 
-async def recover_stage(device, failed, run, tag=''):
+async def recover_stage(device, failed, run, tag='', alias_record=None):
     from pymobiledevice3.services.afc import AfcService
     record = read_json(failed/'journal.json'); bound(record,device)
     if record.get('recovered_by'):
-        print('Этап уже восстановлен:',record['recovered_by'],flush=True)
+        print('Stage already recovered:',record['recovered_by'],flush=True)
         return
     remote = record.get('exported','')
-    require(re.fullmatch(r'airlift-saved-[a-f0-9]{20}',remote),'Неверный путь восстановления.')
+    require(re.fullmatch(r'airlift-saved-[a-f0-9]{20}',remote),'Invalid recovery path.')
     books = read_tree_zip(failed/'books.zip'); state=read_json(failed/'books.json')
-    require(tree_hash(books)==state['hash'],'Копия Books повреждена.')
+    require(tree_hash(books)==state['hash'],'Books backup is damaged.')
     desired = None
     async with AfcService(device) as afc:
+        if alias_record and not record.get('complete') and record.get('phase') == 'final-authorized':
+            final = (record['source'] + '/' + PAYLOAD_PATH if record.get('payload_hash') else record['exported'])
+            require(await exists(afc, final) is None,
+                    'GID placement is still ambiguous. Keep runs; use the explicit full --restore-backup fallback if journal-bound undo cannot recover.')
+            # Placement finished before the host could persist complete=True. Never replace
+            # the whole catalog here: the following bound undo reads it and removes one alias.
+            record['complete'] = True
+            record['placement_recovered'] = True
         if record.get('complete'):
             # The carrier stage finished; only the Books cleanup failed. Never roll back the catalog.
             if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
@@ -1558,33 +2172,34 @@ async def recover_stage(device, failed, run, tag=''):
         if await exists(afc,remote):
             desired = await remote_tree(afc,remote)
             if record.get('original_hash'):
-                require(tree_hash(desired)==record['original_hash'],'Удалённая копия изменилась.')
+                require(tree_hash(desired)==record['original_hash'],'Remote backup changed.')
         elif (failed/'original.zip').exists():
             desired = read_tree_zip(failed/'original.zip')
-            require(tree_hash(desired)==record.get('original_hash'),'Локальная копия повреждена.')
+            require(tree_hash(desired)==record.get('original_hash'),'Local backup is damaged.')
         else:
             # No exported copy on the phone (waited for above) and none saved locally: the catalog
             # was never moved out, and the final asset is only sent after the backup is saved.
             # Only Books and the staging folders in /var/mobile/Media changed: Books is put back
             # here, the staging folders are removed by the next run's cleanup (clean_phone).
             require(record.get('phase') in ('created','staging','host-started','export-check'),
-                    'Нет проверенной копии. Сохраните runs; восстановление остановлено.')
+                    'No verified backup. Keep runs; recovery stopped.')
         if (other:=await restore_books(afc,books,state['existed'],state.get('top'))):record['books_other_changes']=other[:50]
     if desired is not None:
         await require_local_network(device.udid)
         write_tree_zip(run/f'recovery-original{tag}.zip',desired)
-        await transfer(device,run/f'recover{tag}',payload=desired,recovery=True)
+        await transfer(device,run/f'recover{tag}',payload=desired,recovery=True,
+                       expected=desired if alias_record is not None else None)
         observed=await transfer(device,run/f'readback{tag}')
-        require(observed==desired,'Восстановленный каталог не совпадает с копией.')
+        require(observed==desired,'Restored catalog differs from the backup.')
     record['recovered_by']=str(run);record['requires_recovery']=False;record['books_restored']=True
     save_json(failed/'journal.json',record)
 
 
-async def recover_all(device, stages, run):
+async def recover_all(device, stages, run, alias_record=None):
     # Undo newest first: a failed recovery attempt is itself a stage on top of the one it repaired.
     for i,failed in enumerate(reversed(stages),1):
-        print('Восстанавливаю этап:',failed,flush=True)
-        await recover_stage(device,failed,run,f'-{i}' if len(stages)>1 else '')
+        print('Recovering stage:',failed,flush=True)
+        await recover_stage(device,failed,run,f'-{i}' if len(stages)>1 else '', alias_record=alias_record)
 
 
 def check_trigger_hardware(path, hardware, warn=True):
@@ -1601,8 +2216,8 @@ def check_trigger_hardware(path, hardware, warn=True):
                 return True
             break
     if warn:
-        print('Предупреждение: в IPCC нет настроек с подписью для платы '+hardware+
-              '. Пересканирование МОЖЕТ не работать; продолжаю.', flush=True)
+        print('Warning: IPCC contains no signed overrides for board '+hardware+
+              '. Rescan MAY not work; continuing.', flush=True)
     return False
 
 
@@ -1639,8 +2254,8 @@ SIP_ACCESS = {'IEEE-802.11':'Wi-Fi (VoWiFi)','3GPP-E-UTRAN':'LTE (VoLTE)','3GPP-
 
 
 CODEC_NAMES = {'EVS/16000':'EVS (HD Voice+)','AMR-WB/16000':'AMR-WB (HD Voice)',
-               'AMR/8000':'AMR-NB (обычное качество)','PCMA/8000':'G.711 A-law (обычное качество)',
-               'PCMU/8000':'G.711 µ-law (обычное качество)'}
+               'AMR/8000':'AMR-NB (standard quality)','PCMA/8000':'G.711 A-law (standard quality)',
+               'PCMU/8000':'G.711 µ-law (standard quality)'}
 
 
 def sip_answer_codec(message):
@@ -1668,7 +2283,7 @@ def mask_ids(text):
 
 def log_slot(entry):
     # CommCenter prefixes per-subscription lines with "<slot>.<n> "; categories may end in the slot.
-    # Heuristic, unverified on every iOS; unmatched lines are reported as "общее".
+    # Heuristic, unverified on every iOS; unmatched lines are reported as "general".
     if m := re.match(r'([12])\.\d+\s', entry.message):
         return {'1':'kOne','2':'kTwo'}[m.group(1)]
     if m := re.search(r'\bslot (kOne|kTwo)\b', entry.message):
@@ -1724,7 +2339,7 @@ async def commcenter_pid(device, first=False):
         # while the unfiltered log itself streams fine. Only before the first stream:
         # on a reconnect the same error just means the relay is still down.
         if not first: raise
-        print('iPhone не отдал список процессов, беру весь журнал и отбираю CommCenter на компьютере.', flush=True)
+        print('iPhone did not provide a process list; collecting all logs and filtering CommCenter on this computer.', flush=True)
         return ALL_PROCESSES
     return next((int(p) for p, v in pids.items() if v.get('ProcessName') == 'CommCenter'), None)
 
@@ -1741,7 +2356,7 @@ async def commcenter_stream(device, seconds, log_path, on_entry, stop=None):
     from pymobiledevice3.exceptions import ConnectionTerminatedError
     from pymobiledevice3.services.os_trace import OsTraceService
     pid = await commcenter_pid(device, first=True)
-    require(pid is not None, 'Процесс CommCenter не найден на iPhone.')
+    require(pid is not None, 'CommCenter process not found on the iPhone.')
     # Airplane mode, which the instructions ask for, can end the log relay on the phone.
     # Reconnect until the deadline instead of losing the whole collection.
     loop = asyncio.get_running_loop()
@@ -1791,28 +2406,28 @@ async def commcenter_stream(device, seconds, log_path, on_entry, stop=None):
                     if down_since is None:
                         down_since = loop.time()
                         if reset := getattr(on_entry, 'reset', None): reset()  # drop half-read SIP messages
-                        print('Журнал iPhone оборвался (так бывает при включении авиарежима), подключаюсь снова…', flush=True)
+                        print('iPhone log stream interrupted (possible in airplane mode); reconnecting…', flush=True)
                     gave_up = loop.time() - down_since > LOG_RECONNECT_SECONDS
                 if gave_up:
                     # Over Wi-Fi airplane mode may take the whole connection down: keep what was collected.
                     if received: break
-                    raise RuntimeError(f'Журнал iPhone недоступен больше {LOG_RECONNECT_SECONDS} с. '
-                                       'Проверьте кабель или Wi-Fi и повторите.') from error
+                    raise RuntimeError(f'iPhone log unavailable for more than {LOG_RECONNECT_SECONDS} s. '
+                                       'Check USB or Wi-Fi and try again.') from error
                 await asyncio.sleep(min(1, max(0, deadline - loop.time())))
     # CommCenter writes thousands of lines a minute: nothing at all means no log, not a quiet phone.
-    require(received, f'Журнал CommCenter не пришёл за {seconds} с. Проверьте кабель или Wi-Fi и повторите.')
+    require(received, f'No CommCenter log received within {seconds} s. Check USB or Wi-Fi and try again.')
     if down_since is not None:
-        print('Журнал не вернулся' + ('' if loop.time() >= deadline else f' за {LOG_RECONNECT_SECONDS} с') +
-              '. Отчёт собран по тому, что успело прийти.', flush=True)
+        print('Log stream did not resume' + ('' if loop.time() >= deadline else f' within {LOG_RECONNECT_SECONDS} s') +
+              '. Report contains only the entries received.', flush=True)
     elif reconnects:
-        print(f'Журнал прерывался, переподключений: {reconnects}. Отчёт собран по тому, что успело прийти.', flush=True)
+        print(f'Log interrupted; reconnects: {reconnects}. Report contains only the entries received.', flush=True)
 
 
 def diag_collect(state):
     feed_sip = sip_assembler()
     def on_entry(e, msg):
         # Returns the completed SIP message summary, if this entry finished one.
-        slot = log_slot(e) or 'общее'
+        slot = log_slot(e) or 'general'
         for key, pat in DIAG_PATTERNS.items():
             if m := pat.search(msg):
                 state.setdefault(slot, {})[key] = m.groups()
@@ -1838,52 +2453,52 @@ def epdg_text(address):
     except ValueError:
         return address
     if ip.is_loopback or ip.is_unspecified:
-        return (f'{address} — заглушка, а не адрес оператора: обычно так имя ePDG закрывает DNS '
-                '(роутер, фильтр рекламы, VPN или оператор)')
+        return (f'{address} — placeholder, not a carrier address: the ePDG name is usually blocked by DNS '
+                '(router, ad filter, VPN or carrier)')
     return address
 
 
 def diag_report(state, rows):
-    yes = lambda v: {'true':'да','false':'нет','kTrue':'да','kFalse':'нет'}.get(v, v)
+    yes = lambda v: {'true':'yes','false':'no','kTrue':'yes','kFalse':'no'}.get(v, v)
     rat = lambda v: v and {'kRatGSM':'2G (GSM)','kRatUMTS':'3G (UMTS)','kRatLTE':'4G (LTE)','kRatNR':'5G (NR)'}.get(v, v)
-    reg = lambda v: v and {'kRegisteredHome':'в домашней сети','kRegisteredRoaming':'в роуминге',
-                           'kNotRegistered':'нет регистрации','kRegistrationDenied':'отказ сети',
-                           'kSearching':'поиск сети'}.get(v, v)
+    reg = lambda v: v and {'kRegisteredHome':'on home network','kRegisteredRoaming':'roaming',
+                           'kNotRegistered':'not registered','kRegistrationDenied':'network denied registration',
+                           'kSearching':'searching'}.get(v, v)
     lines = []
-    for slot in [r.get('Slot') for r in rows if r.get('Slot') in ('kOne','kTwo')] + ['общее']:
+    for slot in [r.get('Slot') for r in rows if r.get('Slot') in ('kOne','kTwo')] + ['general']:
         s = state.get(slot, {})
-        if slot == 'общее' and not s:
+        if slot == 'general' and not s:
             continue
         head = sim_header(next(r for r in rows if r.get('Slot') == slot)) \
-            if slot != 'общее' else 'Без привязки к SIM (слот не определён по журналу)'
+            if slot != 'general' else 'Not tied to a SIM (slot not identified in the log)'
         lines.append('\n  ' + head)
         g = lambda k, i=0: s[k][i] if k in s and s[k][i] else None
         items = [
-            ('IMS', g('ims_reg') and f"{g('ims_reg')} через {g('ims_reg',1)}"),
-            ('IMS (голос)', yes(g('ims_voice'))),
-            ('IMS через Wi-Fi', g('ims_over_wifi') and f"регистрация: {yes(g('ims_over_wifi'))}, Wi-Fi: {yes(g('ims_over_wifi',1))}"),
-            ('VoWiFi', g('vowifi_pref') and f"настройка: {g('vowifi_pref')}, служба: {g('vowifi_pref',1)}"),
-            ('VoWiFi из', g('vowifi_config') and f"{g('vowifi_config')}, предпочтителен в роуминге: {yes(g('vowifi_config',1))}"),
-            ('Поддержка', g('features') and f"VoLTE {yes(g('features'))}, VoNR {yes(g('features',1))}, VoWiFi {yes(g('features',2))}"),
-            ('Wi-Fi Calling имя', g('wifi_name') and f"«{g('wifi_name')}» (VoWiFi активен)"),
-            ('Регистрация', reg(g('reg_status'))),
-            ('Роуминг', g('roaming') and {'kRoaming':'да','kNotRoaming':'нет'}.get(g('roaming'), g('roaming'))),
-            ('Сеть', rat(g('rat'))),
-            ('Данные', g('data_mode') and g('data_mode').removeprefix('k')),
-            ('Обслуживающая сеть', g('plmn') and f"{g('plmn',1)} ({rat(g('plmn'))})"),
-            ('Сигнал LTE', g('signal') and f"RSRP {float(g('signal')):.0f} дБм, SINR {float(g('signal',1)):.1f} дБ"),
-            ('5G SA', g('sa') and (g('sa') == 'enabled' and 'включён' or f"выключен ({g('sa',1) or 'причина не указана'})")),
-            ('Звонок через', g('call_access')),
-            ('Кодек звонка', g('codec') and CODEC_NAMES.get(g('codec'), g('codec'))),
+            ('IMS', g('ims_reg') and f"{g('ims_reg')} via {g('ims_reg',1)}"),
+            ('IMS (voice)', yes(g('ims_voice'))),
+            ('IMS over Wi-Fi', g('ims_over_wifi') and f"registration: {yes(g('ims_over_wifi'))}, Wi-Fi: {yes(g('ims_over_wifi',1))}"),
+            ('VoWiFi', g('vowifi_pref') and f"setting: {g('vowifi_pref')}, service: {g('vowifi_pref',1)}"),
+            ('VoWiFi from', g('vowifi_config') and f"{g('vowifi_config')}, preferred when roaming: {yes(g('vowifi_config',1))}"),
+            ('Support', g('features') and f"VoLTE {yes(g('features'))}, VoNR {yes(g('features',1))}, VoWiFi {yes(g('features',2))}"),
+            ('Wi-Fi Calling label', g('wifi_name') and f"«{g('wifi_name')}» (VoWiFi active)"),
+            ('Registration', reg(g('reg_status'))),
+            ('Roaming', g('roaming') and {'kRoaming':'yes','kNotRoaming':'no'}.get(g('roaming'), g('roaming'))),
+            ('Network', rat(g('rat'))),
+            ('Data', g('data_mode') and g('data_mode').removeprefix('k')),
+            ('Serving network', g('plmn') and f"{g('plmn',1)} ({rat(g('plmn'))})"),
+            ('LTE signal', g('signal') and f"RSRP {float(g('signal')):.0f} dBm, SINR {float(g('signal',1)):.1f} dB"),
+            ('5G SA', g('sa') and (g('sa') == 'enabled' and 'enabled' or f"disabled ({g('sa',1) or 'reason not reported'})")),
+            ('Call via', g('call_access')),
+            ('Call codec', g('codec') and CODEC_NAMES.get(g('codec'), g('codec'))),
             ('ePDG', g('epdg') and epdg_text(g('epdg'))),
-            ('IKE с ePDG', g('ike_state') and f"{g('ike_state')} → {g('ike_state',1)}"),
-            ('Ошибка IKE', g('ike_error') and f"код {g('ike_error')}: {g('ike_error',1)}"),
+            ('IKE with ePDG', g('ike_state') and f"{g('ike_state')} → {g('ike_state',1)}"),
+            ('IKE error', g('ike_error') and f"code {g('ike_error')}: {g('ike_error',1)}"),
         ]
         shown = [(name, val) for name, val in items if val]
         for name, val in shown:
             lines.append(f'    {name:20} {val}')
         if len(shown) < len(items):
-            lines.append('    остальное: нет в журнале за это время')
+            lines.append('    other fields: not present in this log interval')
     return '\n'.join(lines)
 
 
@@ -1929,16 +2544,16 @@ def registered_again(state, rows, collect):
 
 
 def full_log_hint(out):
-    return (f'Полный журнал CommCenter за это время, с IKE к ePDG (номера замаскированы): {out / "commcenter.log"}')
+    return (f'Full CommCenter log for this interval, including IKE to ePDG (numbers masked): {out / "commcenter.log"}')
 
 
 async def run_diagnose(device, args, rows):
     out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'diagnose')
     out.mkdir(parents=True, mode=0o700)
     pressed = enter_pressed()
-    print(f'Собираю журнал CommCenter до {args.seconds} с. Чтобы iOS заново прошла регистрацию,\n'
-          'включите и через 10 секунд выключите авиарежим (Wi-Fi оставьте включённым).\n'
-          'Сбор закончится сам, когда SIM снова зарегистрируются' + ('; Enter — закончить раньше.' if pressed else '.'),
+    print(f'Collecting CommCenter logs for up to {args.seconds} s. To make iOS register again,\n'
+          'enable airplane mode, wait 10 seconds, then disable it (leave Wi-Fi enabled).\n'
+          'Collection stops when the SIMs register again' + ('; Enter stops early.' if pressed else '.'),
           flush=True)
     state = {}
     on_entry, done = registered_again(state, rows, diag_collect(state))
@@ -1947,7 +2562,7 @@ async def run_diagnose(device, args, rows):
     report = diag_report(state, rows)
     print(report, flush=True)
     (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
-    print('\nСлот SIM определяется по журналу эвристически. ' + full_log_hint(out), flush=True)
+    print('\nSIM slots are identified heuristically from the log. ' + full_log_hint(out), flush=True)
     return 0
 
 
@@ -1955,9 +2570,9 @@ async def run_watch_call(device, args, rows):
     out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'watch-call')
     out.mkdir(parents=True, mode=0o700)
     pressed = enter_pressed()
-    print(f'Слушаю журнал CommCenter до {args.seconds} с. Сделайте тестовый звонок сейчас.\n'
-          'Для VoWiFi: авиарежим + Wi-Fi. Для VoLTE: Wi-Fi выключен.' +
-          ('\nПосле звонка нажмите Enter, чтобы закончить раньше.' if pressed else ''), flush=True)
+    print(f'Listening to CommCenter for up to {args.seconds} s. Make a test call now.\n'
+          'For VoWiFi: airplane mode + Wi-Fi. For VoLTE: Wi-Fi off.' +
+          ('\nPress Enter after the call to finish early.' if pressed else ''), flush=True)
     state = {}
     collect = diag_collect(state)
     def on_entry(e, msg):
@@ -1965,14 +2580,14 @@ async def run_watch_call(device, args, rows):
         slot = {'kOne':'SIM 1','kTwo':'SIM 2'}.get(log_slot(e), '     ')
         if sip:
             first, access, codec = sip
-            extra = ' · '.join(x for x in (access, codec and 'кодек ' + CODEC_NAMES.get(codec, codec)) if x)
+            extra = ' · '.join(x for x in (access, codec and 'codec ' + CODEC_NAMES.get(codec, codec)) if x)
             print(f'  {e.timestamp:%H:%M:%S} {slot} SIP {first}' + (f'  [{extra}]' if extra else ''), flush=True)
         elif m := DIAG_PATTERNS['call_status'].search(msg):
-            print(f'  {e.timestamp:%H:%M:%S} {slot} звонок: {m.group(1)}', flush=True)
+            print(f'  {e.timestamp:%H:%M:%S} {slot} call: {m.group(1)}', flush=True)
     on_entry.reset = collect.reset
     await commcenter_stream(device, args.seconds, out / 'commcenter.log', on_entry, stop=pressed)
     codecs = sorted({CODEC_NAMES.get(v['codec'][0], v['codec'][0]) for v in state.values() if 'codec' in v})
-    print('\nСогласованные кодеки: ' + (', '.join(codecs) if codecs else 'звонков с ответом SDP не было'), flush=True)
+    print('\nNegotiated codecs: ' + (', '.join(codecs) if codecs else 'no calls with an SDP answer'), flush=True)
     report = diag_report(state, rows)
     print(report, flush=True)
     (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
@@ -1982,42 +2597,42 @@ async def run_watch_call(device, args, rows):
 
 # What only the user can check by hand; the log shows registration, not whether a call really works.
 REPORT_QUESTIONS = (
-    'VoWiFi: звонок в авиарежиме по Wi-Fi проходит',
-    'VoWiFi: включается сам, без авиарежима',
-    'VoLTE: без Wi-Fi звонок остаётся в 4G/5G',
-    '5G: полоса n в *3001#12345#* (например n1; «н» — полос n нет)',
-    'iMessage/FaceTime работают с номера',
-    'SMS в авиарежиме по Wi-Fi',
-    'Режим модема',
-    'Объединение и удержание вызовов',
+    'VoWiFi: calls work over Wi-Fi in airplane mode',
+    'VoWiFi: activates automatically without airplane mode',
+    'VoLTE: without Wi-Fi, calls stay on 4G/5G',
+    '5G: n band in *3001#12345#* (for example n1; n means no NR bands)',
+    'iMessage/FaceTime work with the phone number',
+    'SMS over Wi-Fi in airplane mode',
+    'Personal Hotspot',
+    'Call merging and holding',
 )
 
 
 def report_answer(text):
     text = mask_log(text.strip())[:60]
-    if not text: return 'не проверял'
+    if not text: return 'not tested'
     low = text.lower()
-    if low in ('д', 'да', 'y', 'yes', '+'): return 'да'
-    if low in ('н', 'нет', 'n', 'no', '-'): return 'нет'
+    if low in ('y', 'yes', '+'): return 'yes'
+    if low in ('n', 'no', '-'): return 'no'
     return text
 
 
 def report_text(info, rows, diag, answers, region=''):
     # Shareable: model, iOS, operator, the bundle iOS loaded, masked log summary and the user's answers.
-    lines = [f'CarrierSIM {VERSION} · отчёт о профиле',
+    lines = [f'CarrierSIM {VERSION} · profile report',
              f"{MODELS.get(info.get('ProductType'), {}).get('name', info.get('ProductType'))} · "
              f"iOS {info.get('ProductVersion')} ({info.get('BuildVersion')})" + (f' · {region}' if region else '')]
     for r in rows:
         if r.get('Slot') not in SLOT_NAMES: continue
         plmn = f"{r.get('MCC', '')}-{r.get('MNC', '')}"
-        bundle = str(r.get('CFBundleIdentifier', '')).removeprefix('com.apple.') or 'неизвестно'
-        lines.append(f"{SLOT_NAMES[r['Slot']]} · {OPERATORS.get(plmn, plmn)} ({plmn}) · профиль {bundle} "
+        bundle = str(r.get('CFBundleIdentifier', '')).removeprefix('com.apple.') or 'unknown'
+        lines.append(f"{SLOT_NAMES[r['Slot']]} · {OPERATORS.get(plmn, plmn)} ({plmn}) · profile {bundle} "
                      f"{r.get('CFBundleVersion', '')}".rstrip())
         for question, answer in zip(REPORT_QUESTIONS, (answers or {}).get(r['Slot'], ())):
             lines.append(f'    {question.split(" (")[0]}: {answer}')
     if answers is None:
-        lines.append('Ручные проверки: не заданы (запуск без терминала)')
-    lines.append('Журнал CommCenter:' + (diag or '\n  нет данных'))
+        lines.append('Manual checks: not provided (non-interactive run)')
+    lines.append('CommCenter log:' + (diag or '\n  no data'))
     return '\n'.join(lines)
 
 
@@ -2035,13 +2650,13 @@ def plain_ctrl_c():
 async def run_report(device, args, rows):
     out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'report')
     out.mkdir(parents=True, mode=0o700)
-    print(f'Собираю журнал CommCenter {args.seconds} с. Включите и через 10 секунд выключите авиарежим '
-          '(Wi-Fi оставьте включённым).', flush=True)
+    print(f'Collecting CommCenter logs for {args.seconds} s. Enable airplane mode, wait 10 seconds, then disable it '
+          '(leave Wi-Fi enabled).', flush=True)
     state = {}
     await commcenter_stream(device, args.seconds, out / 'commcenter.log', diag_collect(state))
     answers = {}; region = ''; interrupted = False
     if sys.stdin.isatty():
-        print('\nЧто вы проверили сами? «д» — да, «н» — нет, Enter — не проверял.', flush=True)
+        print('\nWhat did you test yourself? y — yes, n — no, Enter — not tested.', flush=True)
         try:
             with plain_ctrl_c():
                 for r in rows:
@@ -2050,22 +2665,22 @@ async def run_report(device, args, rows):
                     # Stored one by one: an interrupted SIM keeps the answers already given.
                     given = answers[r['Slot']] = []
                     for q in REPORT_QUESTIONS: given.append(report_answer(input(f'  {q}: ')))
-                # Free text, not a yes/no answer: «н» here is not «нет».
-                region = mask_log(input('\n  Город или регион (необязательно, Enter — пропустить): ').strip())[:60]
+                # Region is free text, not a yes/no answer.
+                region = mask_log(input('\n  City or region (optional; Enter skips): ').strip())[:60]
         except (EOFError, KeyboardInterrupt):
             # The log is already collected: finish the report with the answers given so far.
             interrupted = True
-            print('\nВопросы прерваны, отчёт собираю с тем, что уже ответили.', flush=True)
+            print('\nQuestions interrupted; report includes the answers already given.', flush=True)
     else:
         answers = None  # not asked at all, unlike a phone without SIM slots
-        print('\nВопросы о ручных проверках пропущены: запуск не из терминала. '
-              'Чтобы ответить, запустите пункт 11 из меню.', flush=True)
+        print('\nManual-check questions skipped: non-interactive run. '
+              'To answer, choose menu item 11.', flush=True)
     text = report_text(DIAG.get('info', {}), rows, diag_report(state, rows), answers, region)
-    if interrupted: text += '\nРучные проверки: вопросы прерваны, ответы неполные'
+    if interrupted: text += '\nManual checks: questions interrupted; answers incomplete'
     (out / 'report.txt').write_text(text + '\n', encoding='utf-8')
-    print('\n===== Отчёт: скопируйте всё до конца блока в тему или issue =====\n' + text +
-          '\n===== конец отчёта =====\n'
-          f'Номер, IMSI и ICCID в отчёт не попадают. Файл: {out / "report.txt"}', flush=True)
+    print('\n===== Profile report\n' + text +
+          '\n===== End of report\n'
+          f'Phone number, IMSI and ICCID are excluded from the report. File: {out / "report.txt"}', flush=True)
     return 0
 
 
@@ -2089,12 +2704,12 @@ async def execute(args,assets):
     run=None
     try:
         info=await device_info(device); DIAG['info']=info; configure_device(info)
-        require(info['ActivationState']=='Activated','iPhone не активирован.')
+        require(info['ActivationState']=='Activated','iPhone is not activated.')
         rows=await carrier_rows(device)
         top=await device.get_value() or {}
         unavailable = no_cellular_sim({**info, **top}, rows)
         if unavailable and not args.recover:
-            output_section('УСТРОЙСТВО')
+            output_section('DEVICE')
             print(f"  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iPadOS {info['ProductVersion']} ({info['BuildVersion']})", flush=True)
             if args.status:
                 print('\n  '+unavailable, flush=True)
@@ -2112,21 +2727,21 @@ async def execute(args,assets):
             if args.sims!='all':
                 # Only this SIM's alias is removed, so its IMSI must be known.
                 restore_imsis={s['imsi'] for s in select_sims(rows,None,slots)}
-        output_section('УСТРОЙСТВО И ПЛАН')
+        output_section('DEVICE AND PLAN')
         print(f"  {MODELS.get(info['ProductType'], {}).get('name', info['ProductType'])} · iOS {info['ProductVersion']} ({info['BuildVersion']})",flush=True)
         row_by_slot={r.get('Slot'):r for r in rows}
         for s in sims:
-            target='штатный профиль' if args.restore else s['bundle'].removesuffix('.bundle')+' (по IMSI)'
+            target='stock profile' if args.restore else s['bundle'].removesuffix('.bundle')+' (by IMSI)'
             print_sim_plan(row_by_slot[s['slot']], top, target)
         for slot in skipped:
-            print_sim_plan(row_by_slot[slot], top, 'не трогаю (зарубежная SIM: добавьте её MCCMNC '
-                           'в bundle.yaml или выберите эту SIM в пункте 7)')
+            print_sim_plan(row_by_slot[slot], top, 'unchanged (foreign SIM: add its MCCMNC '
+                           'to bundle.yaml or choose it in menu item 7)')
         print(flush=True)
         bundles=sorted({s['bundle'] for s in sims if s['bundle']})
         if bundles and DEVICE_FAMILY == 'iPhone':
             # Blocking I/O off the event loop; cached per process, so retries do not wait again.
             catalog=await asyncio.to_thread(load_catalog,args.runs)
-            if catalog: output_section('СВЕДЕНИЯ О ПРОФИЛЯХ')
+            if catalog: output_section('PROFILE INFORMATION')
             for name in bundles:
                 error=catalog_name_error(name,catalog);require(not error,error)
                 if catalog: print(flush=True)
@@ -2135,19 +2750,19 @@ async def execute(args,assets):
         # Only a warning: the write itself stops on the refusal seen in the iPhone log (AirliftClosed).
         if (airlift_may_be_closed(info) and not args.recover
                 and (bool(sims) or args.restore or args.restore_backup)):
-            print(f"\n  Внимание: на iOS {info['ProductVersion']} ({info['BuildVersion']}) запись может не сработать: "
-                  'начиная с 27.2 beta 3 iPhone отказывается переносить файлы AirTraffic. Скрипт попробует; '
-                  'если iPhone откажет, он остановится до каких-либо изменений и скажет об этом. '
-                  'Уже установленный профиль остаётся.\n',flush=True)
+            print(f"\n  Warning: writing on iOS {info['ProductVersion']} ({info['BuildVersion']}) may fail: "
+                  'from 27.2 beta 3 the iPhone refuses AirTraffic file moves. The normal installer will try; '
+                  'if the iPhone refuses, it stops before changes and reports this. '
+                  'The installed profile remains.\n',flush=True)
         if args.status:
-            print('  Сейчас — профиль, который использует устройство.\n'
-                  '  План — профиль для планируемой установки.\n\n'
-                  '  Чтобы определить нужную SIM, сверьте последние 4 символа ICCID:\n'
-                  '  Настройки → Основные → Об этом устройстве → ICCID.',flush=True)
+            print('  Current is the profile the device is using.\n'
+                  '  Plan is the profile proposed for installation.\n\n'
+                  '  Identify the SIM by the last four ICCID digits:\n'
+                  '  Settings → General → About → ICCID.',flush=True)
             blocked=pending(args.runs,udid)
             if blocked:
-                # Menu 7 confirms after this plan: say now that the write will not start, not after "да".
-                print('Внимание: прошлая операция на этом iPhone не завершилась, запись не начнётся. Сначала '
+                # Menu 7 confirms after this plan: explain a blocked write before asking for confirmation.
+                print('Warning: a previous operation on this iPhone is incomplete; writing will not start. First '
                       +recover_hint()+'.',flush=True)
             # The menu must not ask "write?" when the write would not start or has nothing to write.
             if os.environ.get('CARRIERSIM_PLAN') and (blocked or not sims): return NOTHING_TO_WRITE
@@ -2162,16 +2777,16 @@ async def execute(args,assets):
         recover=args.recover
         if recover == Path('AUTO'):
             if not unresolved:
-                print('Незавершённых операций для этого iPhone нет, восстанавливать нечего.');return 0
+                print('No unfinished operations for this iPhone; nothing to recover.');return 0
             recover=unresolved
         require(not unresolved or recover,
-                'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
-                ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
+                'A previous operation on this iPhone is incomplete. First '+recover_hint()+
+                ', then try again. Stage: '+str(unresolved[0] if unresolved else ''))
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
         run.mkdir(mode=0o700); DIAG['run']=run; save_environment(run)
-        output_section('ВЫПОЛНЕНИЕ')
-        print('  Копии и журнал:\n    '+str(run),flush=True)
-        print('\n  Не отключайте iPhone до завершения операции.',flush=True)
+        output_section('EXECUTION')
+        print('  Backups and log:\n    '+str(run),flush=True)
+        print('\n  Keep the iPhone connected until the operation finishes.',flush=True)
         if warning := backup_warning(info.get('cloud_backup')): print(warning,flush=True)
         save_json(run/'device.json',{**info,'udid_hash':digest(udid.encode())})
         trigger=None
@@ -2193,78 +2808,78 @@ async def execute(args,assets):
             if extra!=trigger:extra.unlink()
         if args.trigger:
             trigger=run/'custom-trigger.ipcc';trigger.write_bytes(args.trigger.read_bytes())
-            require(digest(trigger.read_bytes())==custom['sha256'],'Файл IPCC изменился после проверки.')
+            require(digest(trigger.read_bytes())==custom['sha256'],'IPCC file changed after validation.')
         # Recovery itself needs no trigger: it is only for the rescan at the end.
-        require(trigger is not None or recover,'Не найден независимый триггер для этих SIM.')
+        require(trigger is not None or recover,'No independent trigger found for these SIMs.')
         if trigger is not None: DIAG['trigger']=trigger.name
         if not args.recover:
             # No unfinished stage is known here (checked above), so AirLift leftovers are stale.
             cleaned=await clean_phone(device,run)
-            kept=[n for n,v in cleaned.items() if str(v).startswith('не удалён')]
+            kept=[n for n,v in cleaned.items() if str(v).startswith('not removed')]
             removed=[n for n in cleaned if n not in kept]
-            if removed:print('\n  Убраны остатки прошлых запусков:\n    '+'\n    '.join(removed),flush=True)
-            if kept:print('\n  Не удалось убрать остатки прошлых запусков:\n    '+'\n    '.join(kept),flush=True)
+            if removed:print('\n  Removed leftovers from previous runs:\n    '+'\n    '.join(removed),flush=True)
+            if kept:print('\n  Could not remove leftovers from previous runs:\n    '+'\n    '.join(kept),flush=True)
         if recover:
             if isinstance(recover,list):await recover_all(device,recover,run)
             else:await recover_stage(device,recover.resolve(),run)
         elif args.restore:
-            print('\n  [1/4] Подготавливаю пересканирование…',flush=True)
+            print('\n  [1/4] Preparing rescan…',flush=True)
             init=run/'initialize';init.mkdir();await install_trigger(device,trigger,init)
-            print('\n  [2/4] Сохраняю текущие настройки…',flush=True)
+            print('\n  [2/4] Saving current settings…',flush=True)
             original=await transfer(device,run/'snapshot')
             if restore_imsis is not None:
                 now={s['imsi'] for s in select_sims(await carrier_rows(device),None,slots)}
-                require(now==restore_imsis,'SIM изменились во время операции; запись отменена.')
+                require(now==restore_imsis,'SIMs changed during the operation; write cancelled.')
             desired=remove_imsi_links(original,restore_imsis)
             removed=len(original)-len(desired)
             save_json(run/'plan.json',{'action':'remove-imsi','sims':args.sims,'removed':removed,
                                       'before':tree_hash(original),'after':tree_hash(desired)})
             if not removed:
-                print('\n  [3/4] Ссылок по IMSI для выбранных SIM нет: они уже на штатном профиле. Ничего не меняю.',flush=True)
+                print('\n  [3/4] No IMSI aliases for the selected SIMs: they already use stock selection. Nothing changed.',flush=True)
                 return 0
-            print(f'\n  [3/4] Удаляю ссылки по IMSI: {removed}. Проверяю результат…',flush=True)
+            print(f'\n  [3/4] Removing {removed} IMSI aliases. Verifying…',flush=True)
             await transfer(device,run/'restore',payload=desired,expected=original)
-            require(await transfer(device,run/'readback')==desired,'Обратное чтение не совпало.')
+            require(await transfer(device,run/'readback')==desired,'Readback mismatch.')
         elif args.restore_backup:
             failed=args.restore_backup.resolve()/'snapshot'
             record=read_json(failed/'journal.json');bound(record,device)
             desired=read_tree_zip(failed/'original.zip')
-            require(tree_hash(desired)==record.get('original_hash'),'Копия повреждена.')
+            require(tree_hash(desired)==record.get('original_hash'),'Backup is damaged.')
             await transfer(device,run/'restore',payload=desired,recovery=True)
-            require(await transfer(device,run/'readback')==desired,'Обратное чтение не совпало.')
+            require(await transfer(device,run/'readback')==desired,'Readback mismatch.')
         else:
             # A non-overlapping trigger also creates the user catalog on a clean phone.
             init=run/'initialize';init.mkdir()
-            print('\n  [1/4] Подготавливаю пересканирование…',flush=True)
+            print('\n  [1/4] Preparing rescan…',flush=True)
             await install_trigger(device,trigger,init)
-            print('\n  [2/4] Сохраняю исходные настройки…',flush=True)
+            print('\n  [2/4] Saving baseline settings…',flush=True)
             original=await transfer(device,run/'snapshot')
-            require(original is not None,'Не удалось сохранить исходный каталог.')
+            require(original is not None,'Could not save the original catalog.')
             current=select_sims(await carrier_rows(device),args.bundles,slots,any_mcc)
-            require(current==sims,'SIM изменились во время операции; запись отменена.')
+            require(current==sims,'SIMs changed during the operation; write cancelled.')
             desired=make_plan(original,sims)
             save_json(run/'plan.json',{'slots':[{k:v for k,v in s.items() if k!='imsi'} for s in sims],
                                       'before':tree_hash(original),'after':tree_hash(desired)})
-            print('\n  [3/4] Записываю ссылки по IMSI и проверяю результат…',flush=True)
+            print('\n  [3/4] Writing IMSI aliases and verifying…',flush=True)
             await transfer(device,run/'apply',payload=desired,expected=original)
-            require(await transfer(device,run/'readback')==desired,'Обратное чтение не совпало.')
+            require(await transfer(device,run/'readback')==desired,'Readback mismatch.')
         if trigger is None:
-            print('Каталог восстановлен. Пересканирование пропущено: нет подходящего триггера '
-                  'или assets.zip недоступен. Если связь не вернулась, перезагрузите iPhone.',flush=True)
+            print('Catalog restored. Rescan skipped: no suitable trigger '
+                  'or assets.zip unavailable. If service has not returned, restart the iPhone.',flush=True)
             return 0
-        print('\n  [4/4] Ожидаю применения профиля и проверки подписей…',flush=True)
+        print('\n  [4/4] Waiting for profile selection and signature verification…',flush=True)
         rescan=run/'rescan';rescan.mkdir()
         installation=await install_trigger(device,trigger,rescan)
         result=report_log(rescan/'commcenter.log',sims)
         save_json(run/'result.json',{'catalog_verified':True,'installation':installation,'slots':result})
-        output_section('РЕЗУЛЬТАТ')
+        output_section('RESULT')
         unconfirmed=False
         for s in result:
             ok=s['verified'] and (args.restore or (s['selected'] or '').lower()==s['expected'].lower());unconfirmed |= not ok
             print(f"  {SLOT_NAMES[s['slot']]} ({s['plmn']}): "+slot_outcome(s,ok),flush=True)
         if args.restore:
-            print(('Ссылка по IMSI выбранной SIM удалена, другая SIM не тронута.' if restore_imsis else
-                   'Все ссылки по IMSI удалены.')+' Обычные ссылки операторов сохранены.',flush=True)
+            print(('Selected SIM\'s IMSI alias removed; the other SIM is unchanged.' if restore_imsis else
+                   'All IMSI aliases removed.')+' Normal carrier links preserved.',flush=True)
         installing=not (args.restore or args.restore_backup or args.recover)
         missing=[]
         if installing:
@@ -2279,36 +2894,36 @@ async def execute(args,assets):
         if missing:
             # AFC cannot read /System, so a missing bundle only shows up in the rescan log.
             # Never leave links to it: put back the catalog saved before this write.
-            print('iOS не выбрала '+', '.join(missing)+': пакета может не быть в этой версии iOS, имя может '
-                  'быть с ошибкой, или iOS отдаёт этой SIM другой пакет. Возвращаю прежние настройки…',flush=True)
+            print('iOS did not select '+', '.join(missing)+': the bundle may not exist on this iOS build, its name may '
+                  'be incorrect, or iOS selects another bundle for this SIM. Restoring previous settings…',flush=True)
             # The rescan trigger may have touched other parts of the catalog since the readback;
             # only this run's IMSI links must still be exactly as written.
             await transfer(device,run/'rollback',payload=original,
                            expected=lambda tree:imsi_links(tree)==imsi_links(desired))
             require(await transfer(device,run/'rollback-readback')==original,
-                    'Прежние настройки не вернулись: '+recover_hint()+'.')
+                    'Previous settings were not restored: '+recover_hint()+'.')
             rescan=run/'rescan-rollback';rescan.mkdir()
             await install_trigger(device,trigger,rescan)
             save_json(run/'result.json',{'catalog_verified':True,'installation':installation,'slots':result,
                                          'rolled_back':True})
-            print('Прежние настройки возвращены. Проверьте имя пакета (bundle.yaml или пункт 7) и повторите.',flush=True)
+            print('Previous settings restored. Check the bundle name (bundle.yaml or menu item 7) and try again.',flush=True)
             return UNCONFIRMED
         if unconfirmed:
-            print(('Каталог записан, но журнал не подтвердил выбор. Включите авиарежим на 15 секунд и откройте '
-                   'пункт 2 (--status): в строке «сейчас» должен быть нужный профиль. Если там прежний, '
-                   'верните штатный пунктом 4 и пришлите автору журнал операции.') if installing else
-                  ('Журнал не подтвердил выбор штатного профиля. Включите авиарежим на 15 секунд и откройте '
-                   'пункт 2 (--status): в строке «сейчас» должен быть профиль оператора.'),flush=True)
+            print(('Catalog written, but selection was not confirmed in the log. Enable airplane mode for 15 seconds, then open '
+                   'menu item 2 (--status): current should show the requested profile. If it still shows the old one, '
+                   'restore stock IMSI selection with menu item 4 and send the operation log to the author.') if installing else
+                  ('The log did not confirm stock selection. Enable airplane mode for 15 seconds, then open '
+                   'menu item 2 (--status): current should show the carrier profile.'),flush=True)
             return UNCONFIRMED
-        print('\n  Books: служебные файлы синхронизации возвращены в исходное состояние'+books_summary(run)+'.',flush=True)
-        print('\n  Готово. Для полноценной работы профиля рекомендуется перезагрузить устройство.\n'
-              '  После перезагрузки проверьте связь, звонки и интернет.',flush=True)
+        print('\n  Books: original sync files restored'+books_summary(run)+'.',flush=True)
+        print('\n  Done. Restarting the device is recommended for full profile functionality.\n'
+              '  After restarting, test service, calls and data.',flush=True)
         return 0
     except BaseException as error:
         if run:
             save_json(run/'error.json',{'error':error_line(error)})
             # execute_with_retry rolls back any unfinished stage and reports the outcome.
-            print('Операция остановлена. Журнал:',run,file=sys.stderr)
+            print('Operation stopped. Log:',run,file=sys.stderr)
         raise
     finally:await device.close()
 
@@ -2353,10 +2968,10 @@ def linux_usbmuxd_status():
     except OSError:
         socket_exists = False
     if executable:
-        return f'установлен ({executable}); сокет {"есть" if socket_exists else "не обнаружен"}'
+        return f'installed ({executable}); socket {"available" if socket_exists else "not detected"}'
     if socket_exists:
-        return 'сокет /run/usbmuxd есть; исполняемый файл не найден'
-    return 'не найден'
+        return '/run/usbmuxd socket exists; executable not found'
+    return 'not found'
 
 
 def linux_platform_description():
@@ -2373,25 +2988,25 @@ def environment_info():
     import platform
     from importlib.metadata import version, metadata, PackageNotFoundError
     rows = [('CarrierSIM', VERSION),
-            ('Сборка скрипта', digest(SELF.read_bytes())[:12]),
+            ('Script build', digest(SELF.read_bytes())[:12]),
             ('Python', f"{sys.version.split()[0]} {platform.machine()} {'64' if sys.maxsize > 2**32 else '32'}-bit")]
     libs = []
     for name in ('pymobiledevice3', 'cryptography', 'pyimg4', 'pylzss', 'lzfse'):
         try:
             placeholder = 'placeholder' in (metadata(name).get('Summary') or '')
-            libs.append(f"{name} {version(name)}{' (заглушка)' if placeholder else ''}")
+            libs.append(f"{name} {version(name)}{' (placeholder)' if placeholder else ''}")
         except PackageNotFoundError:
-            libs.append(f'{name} нет')
-    rows.append(('Библиотеки', ', '.join(libs)))
+            libs.append(f'{name} no')
+    rows.append(('Libraries', ', '.join(libs)))
     if sys.platform == 'darwin':
         cpu = 'Apple Silicon' if sysctl('hw.optional.arm64') == '1' else 'Intel'
-        if sysctl('sysctl.proc_translated') == '1': cpu += ', Python под Rosetta'
+        if sysctl('sysctl.proc_translated') == '1': cpu += ', Python under Rosetta'
         rows.append(('macOS', f"{platform.mac_ver()[0]} · {sysctl('hw.model') or '?'} · {cpu} · {sysctl('machdep.cpu.brand_string') or ''}".rstrip(' ·')))
         try:
             at = plistlib.loads(Path('/System/Library/PrivateFrameworks/AirTrafficHost.framework/Resources/Info.plist').read_bytes())
             rows.append(('AirTrafficHost', f"{at.get('CFBundleShortVersionString')} ({at.get('CFBundleVersion')})"))
         except Exception:
-            rows.append(('AirTrafficHost', 'версия не прочитана'))
+            rows.append(('AirTrafficHost', 'version unavailable'))
     elif sys.platform == 'win32':
         w = sys.getwindowsversion()
         rows.append(('Windows', f"{platform.release()} {platform.version()} (build {w.build}) · {platform.machine()}"))
@@ -2405,23 +3020,23 @@ def environment_info():
                 if name not in found and (d/name).is_file():
                     found[name] = f'{win_file_version(d/name) or "?"} ({d})'
         for name in ('AirTrafficHost.dll', 'MobileDevice.dll', 'CoreFoundation.dll'):
-            rows.append((name, found.get(name, 'не найдена')))
+            rows.append((name, found.get(name, 'not found')))
         itunes = [Path(os.environ[k])/'iTunes'/'iTunes.exe' for k in ('ProgramW6432', 'ProgramFiles') if os.environ.get(k)]
         itunes = next((x for x in itunes if x.is_file()), None)
-        rows.append(('iTunes', win_file_version(itunes) if itunes else 'iTunes.exe не найден (возможно, версия из Microsoft Store)'))
+        rows.append(('iTunes', win_file_version(itunes) if itunes else 'iTunes.exe not found (possibly a Microsoft Store version)'))
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Services\Apple Mobile Device Service'):
-                rows.append(('Apple Mobile Device Service', 'установлена'))
+                rows.append(('Apple Mobile Device Service', 'installed'))
         except Exception:
-            rows.append(('Apple Mobile Device Service', 'не найдена'))
+            rows.append(('Apple Mobile Device Service', 'not found'))
     elif sys.platform.startswith('linux'):
         rows.append(('Linux', linux_platform_description()))
-        rows.append(('AirTraffic', 'native com.apple.atc через pymobiledevice3'))
+        rows.append(('AirTraffic', 'native com.apple.atc via pymobiledevice3'))
         rows.append(('usbmuxd', linux_usbmuxd_status()))
-        rows.append(('Транспорт', 'usbmuxd / lockdownd'))
+        rows.append(('Transport', 'usbmuxd / lockdownd'))
     else:
-        rows.append(('ОС', platform.platform()))
+        rows.append(('OS', platform.platform()))
     return rows
 
 
@@ -2439,7 +3054,7 @@ def outstanding_assets(tree):
 
 def books_summary(run):
     changes = sorted({c for j in run.glob('*/journal.json') for c in read_json(j).get('books_other_changes', [])})
-    return ('; за время установки в корне Books изменилось: ' + ', '.join(changes[:10])) if changes else ''
+    return ('; Books root changes during installation: ' + ', '.join(changes[:10])) if changes else ''
 
 
 def run_details(run):
@@ -2448,27 +3063,27 @@ def run_details(run):
         stage = journal.parent
         try: j = read_json(journal)
         except Exception: continue
-        line = f"фаза {j.get('phase')}, завершён {bool(j.get('complete'))}, Books восстановлен {j.get('books_restored')}"
-        if j.get('stale_books_removed'): line += f", удалены старые записи: {j['stale_books_removed']}"
-        if j.get('books_other_changes'): line += f", iOS изменила в Books: {', '.join(j['books_other_changes'][:8])}"
+        line = f"phase {j.get('phase')}, complete {bool(j.get('complete'))}, Books restored {j.get('books_restored')}"
+        if j.get('stale_books_removed'): line += f", stale entries removed: {j['stale_books_removed']}"
+        if j.get('books_other_changes'): line += f", iOS changed in Books: {', '.join(j['books_other_changes'][:8])}"
         if j.get('media_leftovers'):
             old = sorted({n.rsplit('-', 1)[-1] for n in j['media_leftovers']} - {str(j.get('source', '')).rsplit('-', 1)[-1]})
-            rows.append(('  Остатки прошлых запусков в Media', ', '.join(j['media_leftovers'][:12]) + (f' (запусков: {len(old)})' if old else '')))
-        if j.get('operation_error'): line += f", ошибка: {j['operation_error']}"
-        rows.append((f'Этап {stage.name}', line))
+            rows.append(('  Previous run leftovers in Media', ', '.join(j['media_leftovers'][:12]) + (f' (runs: {len(old)})' if old else '')))
+        if j.get('operation_error'): line += f", error: {j['operation_error']}"
+        rows.append((f'Stage {stage.name}', line))
         try:
             b = read_json(stage/'books.json'); tree = read_tree_zip(stage/'books.zip')
             known = [n for n in (x.removeprefix('Books/') for x in BOOK_FILES + BOOK_DIRS[1:]) if n in tree]
-            rows.append(('  Books до операции', f"{'был' if b.get('existed') else 'не было'}, служебные: {', '.join(known) or 'нет'}"
-                         + (f", в корне: {', '.join(b['top'][:15])}" if b.get('top') else '')))
+            rows.append(('  Books before operation', f"{'existed' if b.get('existed') else 'absent'}, sync files: {', '.join(known) or 'no'}"
+                         + (f", root: {', '.join(b['top'][:15])}" if b.get('top') else '')))
             outstanding = outstanding_assets(tree)
             if outstanding is not None:
                 mine = [x for x in outstanding if our_trace(x[0])]
-                rows.append(('  Незавершённые загрузки Books', f'{len(outstanding)}, из них скрипта {len(mine)}'))
+                rows.append(('  Outstanding Books downloads', f'{len(outstanding)}, belonging to this tool {len(mine)}'))
                 for pid, done in mine[:6]:
-                    rows.append(('    загрузка', f'{pid} → {done or "не завершена"}'))
+                    rows.append(('    download', f'{pid} → {done or "incomplete"}'))
             traces = sorted(n for n, (k, d) in tree.items() if k == 'f' and b'airlift' in d)
-            if traces: rows.append(('  Следы airlift в Books', ', '.join(traces)))
+            if traces: rows.append(('  airlift traces in Books', ', '.join(traces)))
         except Exception:
             pass
         host = stage/'host.jsonl'
@@ -2480,22 +3095,22 @@ def run_details(run):
                 except ValueError: continue
                 if row.get('event') == 'manifest':
                     if type(row.get('expected')) is int:
-                        rows.append(('  Ответ AirTraffic',
-                                     f"ожидалось {row['expected']}, найдено {row.get('matched')}, "
-                                     f"повторяется {row.get('duplicate', 0)}"))
+                        rows.append(('  AirTraffic response',
+                                     f"expected {row['expected']}, matched {row.get('matched')}, "
+                                     f"duplicates {row.get('duplicate', 0)}"))
                         continue
                     book = row.get('book', [])
                     expected = set(row.get('expected', []))
-                    rows.append(('  Ответ AirTraffic', f"типы {row.get('dataclasses')}, объектов Book {len(book)}, "
+                    rows.append(('  AirTraffic response', f"dataclasses {row.get('dataclasses')}, Book objects {len(book)}, "
                                  f"IsDownload {sum(1 for x in book if x.get('IsDownload') in ('True', '1'))}, "
-                                 f"наших {sum(1 for x in book if x.get('AssetID') in expected)} из {len(expected)}"))
+                                 f"ours {sum(1 for x in book if x.get('AssetID') in expected)} of {len(expected)}"))
                     for x in book[:5]:
                         rows.append(('    Book', ', '.join(f'{k}={v[:60]}' for k, v in x.items())))
                 elif row.get('ok') is False:
-                    rows.append(('  Ошибка AirTraffic', str(row.get('error'))))
+                    rows.append(('  AirTraffic error', str(row.get('error'))))
                 elif row.get('event') == 'message':
                     names.append(row.get('name'))
-            if names: rows.append(('  Сообщения AirTraffic', ' → '.join(map(str, names))))
+            if names: rows.append(('  AirTraffic messages', ' → '.join(map(str, names))))
         dlog = stage/'device.log'
         if dlog.exists():
             lines = dlog.read_text(encoding='utf-8', errors='replace').splitlines()
@@ -2507,7 +3122,7 @@ def run_details(run):
             benign = ('ATGetUsageForPath', 'Artwork file does not exist', 'ATStoreInfo with no',
                       "Asset path isn't in one of the expected directories", 'Could not create sandbox extension')
             key = [l for l in lines if source.search(l) and problem.search(l) and not any(b in l for b in benign)]
-            rows.append(('  Журнал iPhone', f'{len(lines)} строк, важных {len(key)}'))
+            rows.append(('  iPhone log', f'{len(lines)} lines, relevant {len(key)}'))
             for l in key[-12:]:
                 rows.append(('    iPhone', re.sub(r'^\w{3} +\d+ [\d:]+ \S+ ', '', l.strip())[:300]))
         err = stage/'host.stderr'
@@ -2519,9 +3134,9 @@ def run_details(run):
         if f.exists():
             try:
                 j = read_json(f)
-                rows.append((f'Триггер ({name})', f"установлен {j.get('ipcc_installation_completed')}"
-                             + (f", ошибка: {j['installation_error']}" if j.get('installation_error') else '')
-                             + (f", журнал: {j['log_error']}" if j.get('log_error') else '')))
+                rows.append((f'Trigger ({name})', f"installed {j.get('ipcc_installation_completed')}"
+                             + (f", error: {j['installation_error']}" if j.get('installation_error') else '')
+                             + (f", log: {j['log_error']}" if j.get('log_error') else '')))
             except Exception:
                 pass
     return rows
@@ -2545,7 +3160,7 @@ class Tee:
 def start_session_log(runs):
     path = runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'session.log')
     log = path.open('a', encoding='utf-8', buffering=1)
-    log.write(f'CarrierSIM {VERSION} · сборка {digest(SELF.read_bytes())[:12]}\n')
+    log.write(f'CarrierSIM {VERSION} · build {digest(SELF.read_bytes())[:12]}\n')
     log.write(' '.join(['carrier.py'] + sys.argv[1:]) + '\n')
     sys.stdout, sys.stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
     DIAG['session_log'] = str(path)
@@ -2559,7 +3174,7 @@ def save_environment(run):
 def print_diagnostics(error):
     rows = []
     try: rows += environment_info()
-    except Exception as e: rows.append(('Окружение', f'не собрано: {error_text(e)}'))
+    except Exception as e: rows.append(('Environment', f'unavailable: {error_text(e)}'))
     info = DIAG.get('info')
     if info:
         rows.append(('iPad' if str(info['ProductType']).startswith('iPad') else 'iPhone', f"{MODELS.get(info['ProductType'], {}).get('name', '?')} · {info['ProductType']} · "
@@ -2568,25 +3183,25 @@ def print_diagnostics(error):
             rows.append(('  SIM', f"{c.get('Slot')} {c.get('MCC','')}{c.get('MNC','')} {c.get('CFBundleIdentifier','')} {c.get('CFBundleVersion','')}"))
     args = DIAG.get('args')
     if args is not None:
-        rows.append(('Действие', ' '.join(a for a in sys.argv[1:]) or 'установка'))
-        rows.append(('Профиль', f"{getattr(args, 'bundles', None) or getattr(args, 'bundle', None)}, SIM: {getattr(args, 'sims', 'all')}"))
-    if DIAG.get('trigger'): rows.append(('Триггер', DIAG['trigger']))
-    if DIAG.get('cleanup'): rows.append(('Очистка телефона', json.dumps(DIAG['cleanup'], ensure_ascii=False)[:600]))
+        rows.append(('Action', ' '.join(a for a in sys.argv[1:]) or 'install'))
+        rows.append(('Profile', f"{getattr(args, 'bundles', None) or getattr(args, 'bundle', None)}, SIM: {getattr(args, 'sims', 'all')}"))
+    if DIAG.get('trigger'): rows.append(('Trigger', DIAG['trigger']))
+    if DIAG.get('cleanup'): rows.append(('Device cleanup', json.dumps(DIAG['cleanup'], ensure_ascii=False)[:600]))
     run = DIAG.get('run')
     if run:
-        rows.append(('Папка операции', str(run)))
+        rows.append(('Operation directory', str(run)))
         try: rows += run_details(run)
-        except Exception as e: rows.append(('Журналы', f'не прочитаны: {error_text(e)}'))
-    rows.append(('Ошибка', error_line(error)))
+        except Exception as e: rows.append(('Logs', f'unreadable: {error_text(e)}'))
+    rows.append(('Error', error_line(error)))
     import traceback
     frames = [f for f in traceback.extract_tb(error.__traceback__) if f.filename.endswith(('carrier.py', 'launch.py', 'airtraffic_apple.py'))]
     if frames:
-        rows.append(('Где', ' → '.join(f'{f.name}:{f.lineno}' for f in frames[-4:])))
-    if DIAG.get('session_log'): rows.append(('Журнал сеанса', DIAG['session_log']))
+        rows.append(('Location', ' → '.join(f'{f.name}:{f.lineno}' for f in frames[-4:])))
+    if DIAG.get('session_log'): rows.append(('Session log', DIAG['session_log']))
     text = '\n'.join(f'{k}: {v}' for k, v in rows)
-    print('\n===== Данные для отладки =====', file=sys.stderr)
+    print('\n===== Debug information =====', file=sys.stderr)
     print(text, file=sys.stderr)
-    print('===== конец блока =====\n', file=sys.stderr, flush=True)
+    print('===== End of debug block =====\n', file=sys.stderr, flush=True)
     if run:
         with contextlib.suppress(Exception):
             (run / 'diagnostics.txt').write_text(text + '\n\n' + ''.join(traceback.format_exception(error)), encoding='utf-8')
@@ -2600,73 +3215,105 @@ def main():
             host_worker(value)
             return 0
         except Exception as e:framed({'ok':False,'error':error_text(e)});return 1
-    parser=argparse.ArgumentParser(description='Профиль из bundle.yaml для SIM России и Беларуси; зарубежные — только по явному выбору. '
-        'Без флагов: установить по IMSI на SIM, сообщённые iPhone. Без ограничений по модели iPhone и версии iOS; совместимость не гарантируется.',
+    parser=argparse.ArgumentParser(description='Install T-Mobile Wholesale automatically with --tmobile-wholesale. '
+        'Default IMSI workflow: bundle.yaml for Russian and Belarusian SIMs; foreign SIMs require explicit selection. '
+        'No normal-install model or iOS restriction; compatibility is not guaranteed.',
         add_help=False)
     parser.add_argument('--version', action='version', version=f'CarrierSIM {VERSION}')
-    parser.add_argument('-h','--help',action='help',help='показать эту справку')
+    parser.add_argument('-h','--help',action='help',help='show this help')
     group=parser.add_mutually_exclusive_group()
-    group.add_argument('--check',action='store_true',help='проверить файлы и AirTraffic backend, без подключения к телефону')
+    group.add_argument('--check',action='store_true',help='check files and AirTraffic backend without connecting to a device')
     group.add_argument('--atc-probe',action='store_true',help=argparse.SUPPRESS)
-    group.add_argument('--status',action='store_true',help='показать найденные SIM и план, ничего не записывать')
-    group.add_argument('--restore',action='store_true',help='удалить ссылки по IMSI и включить штатный выбор профилей; с --sims 1 или 2 только для этой SIM')
-    group.add_argument('--restore-backup',type=Path,metavar='КАТАЛОГ',help='дополнительно: вернуть каталог из конкретной резервной копии')
-    group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='ЭТАП',help='восстановиться после сбоя автоматически; путь к этапу необязателен')
-    group.add_argument('--report',action='store_true',help='обезличенный отчёт о профиле для таблицы: журнал CommCenter + что вы проверили сами; только чтение')
-    group.add_argument('--diagnose',action='store_true',help='отчёт по SIM: IMS, VoLTE/VoWiFi/VoNR, роуминг, сеть, 5G SA; только чтение журнала')
-    group.add_argument('--watch-call',action='store_true',help='слушать журнал во время тестового звонка: кодек (EVS/AMR), канал; только чтение')
-    parser.add_argument('--bundle',metavar='ПАКЕТ',
-                        help='один системный пакет для всех выбранных SIM вместо bundle.yaml, например O2_Germany')
+    parser.add_argument('--status',action='store_true',help='show detected SIMs and a read-only plan')
+    group.add_argument('--restore',action='store_true',help='remove IMSI aliases and restore stock selection; --sims 1 or 2 affects only that SIM; GID aliases are unchanged')
+    group.add_argument('--restore-backup',type=Path,metavar='DIRECTORY',help='fallback: restore the entire carrier catalog from this backup run')
+    group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='STAGE',help='recover interrupted stages and GID operations; verified installed GID profiles are left applied')
+    group.add_argument('--report',action='store_true',help='shareable profile report: CommCenter log and manual checks; read-only')
+    group.add_argument('--diagnose',action='store_true',help='SIM report: IMS, VoLTE/VoWiFi/VoNR, roaming, network, 5G SA; log read-only')
+    group.add_argument('--watch-call',action='store_true',help='listen during a test call: codec (EVS/AMR), access network; read-only')
+    experiment = parser.add_mutually_exclusive_group()
+    experiment.add_argument('--gid1', metavar='HEX', help='experimental PLMN/GID1 alias; requires explicit --bundle and --sims 1 or 2')
+    experiment.add_argument('--undo-gid1', type=Path, metavar='RUN_DIRECTORY', help='remove only the alias owned by this run journal; --status previews')
+    experiment.add_argument('--tmobile-wholesale', action='store_true',
+                            help='USB-only automatic T-Mobile Wholesale install: discover the matched GID1 key and qualify by full ICCID; --status previews')
+    experiment.add_argument('--remove-tmobile-wholesale', action='store_true',
+                            help='USB-only explicit removal of an owned ICCID-qualified Wholesale installation; --status previews')
+    parser.add_argument('--gid1-iccid', action='store_true',
+                        help='with --gid1, add the selected SIM’s full ICCID qualifier and verify carrier/operator selection')
+    parser.add_argument('--bundle',metavar='BUNDLE',
+                        help='use one system bundle for all selected SIMs instead of bundle.yaml, for example O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
-                        help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию; '
-                             'при установке all пропускает зарубежные SIM без своей строки в bundle.yaml)')
-    parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
-    parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
-    parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose и --report (по умолчанию 90) или --watch-call (по умолчанию 180)')
-    parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
-    parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если подключено несколько')
-    parser.add_argument('--wifi',action='store_true',help='подключаться по Wi-Fi вместо кабеля (медленнее); нужны доверие и «Показывать iPhone при Wi-Fi», включённые заранее через кабель')
-    parser.add_argument('--apple-dir',action='append',default=[],metavar='ПАПКА',help='Windows: папка DLL Apple; можно указать несколько раз')
-    parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='ПАПКА',help='куда сохранять копии и журналы (по умолчанию runs рядом со скриптом; свою папку внутри git-репозитория добавьте в .git/info/exclude)')
-    parser._optionals.title='Параметры'
+                        help='SIM slots: 1, 2 or all (default). T-Mobile automatic modes detect the sole eligible SIM/owned run; '
+                             'ordinary install skips foreign SIMs without their own bundle.yaml entry')
+    parser.add_argument('--trigger',type=Path,metavar='IPCC',help='custom signed IPCC instead of the included trigger; board and SIMs are checked')
+    parser.add_argument('--attempts',type=int,default=3,metavar='N',help='attempts after transient connection errors (default 3); GID apply never retries')
+    parser.add_argument('--seconds',type=int,metavar='SECONDS',help='duration of --diagnose and --report (default 90) or --watch-call (default 180)')
+    parser.add_argument('--wait-seconds',type=int,default=180,metavar='SECONDS',help='wait for connection and unlock (default 180 seconds)')
+    parser.add_argument('--udid',metavar='ID',help='choose a device when several are connected')
+    parser.add_argument('--wifi',action='store_true',help='connect over Wi-Fi instead of USB (slower); first pair and enable Show this iPhone when on Wi-Fi over USB; unavailable for GID modes')
+    parser.add_argument('--apple-dir',action='append',default=[],metavar='DIRECTORY',help='Windows: Apple DLL directory; may be repeated')
+    parser.add_argument('--runs',type=Path,default=ROOT/'runs',metavar='DIRECTORY',help='backup and log directory (default runs next to the script; add a custom directory inside a git repository to .git/info/exclude)')
+    parser._optionals.title='Options'
     args=parser.parse_args()
+    if args.gid1_iccid and args.gid1 is None:
+        parser.error('--gid1-iccid requires --gid1; undo derives qualifiers from its saved journal.')
+    if args.gid1 is not None or args.undo_gid1 is not None or args.tmobile_wholesale or args.remove_tmobile_wholesale:
+        if any((args.check, args.atc_probe, args.restore, args.restore_backup, args.recover,
+                args.report, args.diagnose, args.watch_call)):
+            parser.error('GID and T-Mobile modes are incompatible with other write, recovery, diagnostic or check actions.')
+        if args.wifi:
+            parser.error('GID and T-Mobile installation/removal are USB-only; remove --wifi.')
+        if args.tmobile_wholesale or args.remove_tmobile_wholesale:
+            if args.bundle:
+                parser.error('Automatic T-Mobile modes use a fixed saved/system bundle; do not supply --bundle.')
+            if args.tmobile_wholesale:
+                args.bundle = TMOBILE_WHOLESALE
+        elif args.gid1 is not None:
+            if not args.bundle or args.sims not in ('1', '2'):
+                parser.error('--gid1 requires an explicit --bundle and one --sims slot (1 or 2).')
+            args.gid1 = normalize_gid1(args.gid1)
+        elif args.bundle or args.sims != 'all':
+            parser.error('--undo-gid1 uses its saved binding, not --bundle or --sims.')
+    elif args.status and any((args.check, args.atc_probe, args.restore, args.restore_backup, args.recover,
+                              args.report, args.diagnose, args.watch_call)):
+        parser.error('--status is incompatible with this action.')
     if not os.environ.get('CARRIERSIM_MENU'):
         print(f'CarrierSIM · {VERSION}',flush=True)
-        print('Профили операторов · iPhone / iPad',flush=True)
-        print('VoWiFi / 5G / EVS  · Россия / Беларусь',flush=True)
-        print('Автор: Vladimir B / vlw · vlwwwwww@gmail.com',flush=True)
+        print('Carrier profiles · iPhone / iPad',flush=True)
+        print('VoWiFi / 5G / EVS  · Russia / Belarus',flush=True)
+        print('Author: Vladimir B / vlw · vlwwwwww@gmail.com',flush=True)
         print('GitHub: https://github.com/ios-bundles/CarrierSIM',flush=True)
     DIAG['args']=args
     if args.bundle:
         args.bundle=args.bundle.strip().removesuffix('.bundle')+'.bundle'
         require(re.fullmatch(r'[A-Za-z0-9_]+\.bundle',args.bundle),
-                'Имя пакета может содержать только латинские буквы, цифры и _, например O2_Germany.')
+                'Bundle names may contain only ASCII letters, digits and _, for example O2_Germany.')
         args.bundles={'default':args.bundle}
     else:
         args.bundles=load_bundle_config()
-    require(1 <= args.attempts <= 10, 'Число попыток должно быть от 1 до 10.')
-    require(0 <= args.wait_seconds <= 3600, 'Ожидание должно быть от 0 до 3600 секунд.')
+    require(1 <= args.attempts <= 10, 'Attempts must be between 1 and 10.')
+    require(0 <= args.wait_seconds <= 3600, 'Wait time must be between 0 and 3600 seconds.')
     args.seconds = args.seconds or (180 if args.watch_call else 90)
-    require(10 <= args.seconds <= 1800, '--seconds: от 10 до 1800.')
+    require(10 <= args.seconds <= 1800, '--seconds must be between 10 and 1800.')
     os.umask(0o077)
-    require(sys.version_info >= (3,11), 'Нужен Python 3.11 или новее.')
+    require(sys.version_info >= (3,11), 'Python 3.11 or later is required.')
     from importlib.metadata import version, PackageNotFoundError
     try: installed=version('pymobiledevice3')
-    except PackageNotFoundError: raise RuntimeError('Установите зависимости: python -m pip install -r requirements.txt') from None
-    require(installed=='11.12.5', 'Нужен pymobiledevice3 11.12.5: python -m pip install -r requirements.txt')
+    except PackageNotFoundError: raise RuntimeError('Install dependencies: python -m pip install -r requirements.txt') from None
+    require(installed=='11.12.5', 'pymobiledevice3 11.12.5 is required: python -m pip install -r requirements.txt')
     try: assets=load_assets()
     except Exception as error:
         # Recovery must not depend on the bundled triggers: they are only used for the final rescan.
         if not args.recover: raise
-        print(f'Предупреждение: assets.zip недоступен ({error_text(error)}). Восстановление пройдёт без пересканирования.',flush=True)
+        print(f'Warning: assets.zip unavailable ({error_text(error)}). Normal stage recovery will skip rescan; GID undo requires a verified trigger.',flush=True)
         assets=None
     global APPLE_DIRS, CONNECTION
-    if args.wifi: CONNECTION='Network'
+    CONNECTION = 'Network' if args.wifi else 'USB'
     APPLE_DIRS=[str(Path(p).resolve()) for p in args.apple_dir]
     if sys.platform.startswith('linux'):
-        require(linux_usbmuxd_status() != 'не найден',
-                'usbmuxd не найден. Установите системный usbmuxd и запустите службу '
-                '(например, Debian/Ubuntu: sudo apt install usbmuxd), затем повторите --check.')
+        require(linux_usbmuxd_status() != 'not found',
+                'usbmuxd not found. Install the system usbmuxd and start its service '
+                '(for example, Debian/Ubuntu: sudo apt install usbmuxd), then retry --check.')
     # No shell, no compiler, no native executable bundled with the archive.
     check=subprocess.run(host_command()+['check'],input=json.dumps({'directories':APPLE_DIRS,'connection':CONNECTION}),
                          capture_output=True,text=True,encoding='utf-8',timeout=20)
@@ -2678,9 +3325,9 @@ def main():
         import pymobiledevice3.lockdown, pymobiledevice3.usbmux, pymobiledevice3.services.afc, \
             pymobiledevice3.services.installation_proxy, pymobiledevice3.services.os_trace, pymobiledevice3.services.syslog
         for k,v in environment_info():print(f'{k}: {v}')
-        print('Триггеры целы, AirTraffic backend доступен; пакеты будут взяты из системы iPhone. Подключений к телефону не было.');return 0
+        print('Triggers intact, AirTraffic backend available; bundles will come from the device system. No device connections were made.');return 0
     if args.atc_probe:
-        require(host_backend() == 'linux-native-atc', '--atc-probe доступен только на Linux')
+        require(host_backend() == 'linux-native-atc', '--atc-probe is available only on Linux')
         from airtraffic_native import run_session
         async def probe():
             udid = await choose_device(args.udid, args.wait_seconds)
@@ -2694,22 +3341,22 @@ def main():
         args.runs.mkdir(parents=True,exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=args.runs,prefix='.write-test-'):pass
     except OSError:
-        raise RuntimeError(f'Скрипт не может сохранить копии в папку: {args.runs}\n'
-                           'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
-                           'в «Загрузки» и запустите оттуда.') from None
+        raise RuntimeError(f'Cannot save backups to: {args.runs}\n'
+                           'Close this window, copy the entire CarrierSIM folder '
+                           'to Downloads and launch it from there.') from None
     with contextlib.suppress(OSError):start_session_log(args.runs)
-    print('Разблокируйте iPhone или iPad и подтвердите доверие компьютеру. Закройте синхронизацию Finder/iTunes.',flush=True)
+    print('Unlock the iPhone or iPad and confirm trust. Close Finder/iTunes sync.',flush=True)
     with operation_lock(args.runs):return asyncio.run(execute_with_retry(args,assets)) or 0
 
 
 def cli():
     try:sys.exit(main())
     except KeyboardInterrupt:
-        print('Прервано. Не удаляйте папку runs. Если запись уже началась, '+recover_hint()+'.',file=sys.stderr);sys.exit(130)
+        print('Interrupted. Keep the runs folder. If writing already started, '+recover_hint()+'.',file=sys.stderr);sys.exit(130)
     except Exception as e:
         if not (len(sys.argv)>1 and sys.argv[1]=='--_host'):
             with contextlib.suppress(Exception):print_diagnostics(e)
-        print('Ошибка:',error_text(e),file=sys.stderr);sys.exit(1)
+        print('Error:',error_text(e),file=sys.stderr);sys.exit(1)
 
 
 if __name__=='__main__':

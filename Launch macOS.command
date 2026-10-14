@@ -10,13 +10,13 @@ for candidate in python3.12 python3.11 python3.13 python3.14 python3; do
     fi
 done
 if [ -z "$carrier_python" ]; then
-    echo 'Установите Python 3.11 или новее: https://www.python.org/downloads/macos/'
+    echo 'Install Python 3.11 or newer: https://www.python.org/downloads/macos/'
     carrier_status=1
 else
     "$carrier_python" -u launch.py "$@"
     carrier_status=$?
 fi
 if [ "$carrier_status" -ne 0 ] && [ "$#" -eq 0 ] && [ -t 0 ]; then
-    read -r -p 'Нажмите Enter, чтобы закрыть окно…' carrier_reply
+    read -r -p 'Press Enter to close this window…' carrier_reply
 fi
 exit "$carrier_status"

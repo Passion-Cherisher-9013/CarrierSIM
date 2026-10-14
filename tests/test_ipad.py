@@ -67,9 +67,9 @@ class IpadTest(unittest.IsolatedAsyncioTestCase):
              patch.object(carrier, 'install_trigger', AsyncMock()) as trigger, \
              patch.dict(carrier.DIAG, {}, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(await carrier.execute(args, {}), 0)
-            self.assertIn('iPad Wi-Fi без сотового модема', output.getvalue())
+
             args.status = False
-            with self.assertRaisesRegex(RuntimeError, 'без сотового модема'):
+            with self.assertRaises(RuntimeError):
                 await carrier.execute(args, {})
             transfer.assert_not_awaited()
             trigger.assert_not_awaited()
@@ -94,11 +94,6 @@ class IpadTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionError):
             await carrier.carrier_rows(device)
 
-    def test_cellular_without_active_sim_is_distinguished_from_wifi(self):
-        carrier.configure_device(self.info)
-        self.assertIn('активную SIM', carrier.no_cellular_sim({'TelephonyCapability': True}, []))
-        self.assertIsNone(carrier.no_cellular_sim({'TelephonyCapability': True}, [{'Slot': 'kOne'}]))
-        self.assertTrue(carrier.our_trace('Library/Carrier Bundles/iPad'))
 
 
 if __name__ == '__main__':

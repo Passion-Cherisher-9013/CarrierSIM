@@ -1,9 +1,9 @@
-# Бандл по умолчанию для SIM операторов России (250) и Беларуси (257); зарубежные SIM он не трогает
+# Default bundle for Russian (250) and Belarusian (257) SIMs; foreign SIMs are left untouched
 default: Vodafone_hu
-# Можете выбрать бандл для конкретного оператора (250 01 = MTS RUS), MCCMNC без пробела
+# Choose a bundle for a specific carrier (250 01 = MTS RUS); MCCMNC has no spaces
 25001: Vodafone_ro
 
-### Беларусь (2G-5G переключатели, VoLTE+EVS работают, 5G n7 работает, значок LTE)
+### Belarus (2G–5G controls, working VoLTE+EVS and 5G n7, LTE indicator)
 # A1 BY
 25701: MTS_ua
 # MTS BY

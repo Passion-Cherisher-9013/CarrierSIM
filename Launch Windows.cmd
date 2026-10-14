@@ -28,7 +28,7 @@ for /d %%D in ("%LOCALAPPDATA%\Python\pythoncore-3*" "%LOCALAPPDATA%\Programs\Py
         )
     )
 )
-echo Не найден Python 3.11 или новее, x64. Установите его: https://www.python.org/downloads/windows/
+echo Python 3.11 or newer, x64, was not found. Install it: https://www.python.org/downloads/windows/
 set "CARRIER_STATUS=1"
 goto finish
 :run

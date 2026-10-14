@@ -55,9 +55,9 @@ jobs:
           else
             if [ "$RELEASE_TAG" = v1 ]; then
               cat > notes.txt <<'NOTES'
-          CarrierSIM v1 для macOS и Windows
+          CarrierSIM v1 for macOS and Windows
 
-          Первый релиз - версия работает только на iOS 27
+          First release - this version works only on iOS 27
           NOTES
             else
               touch notes.txt

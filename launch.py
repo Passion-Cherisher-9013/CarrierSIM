@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Локальное окружение и меню запуска. Сам по себе телефон не изменяет."""
+"""Local environment and launcher menu. This module does not modify the phone itself."""
 import base64
 import hashlib
 import os
@@ -39,9 +39,9 @@ def check_writable():
         with tempfile.NamedTemporaryFile(dir=ROOT, prefix='.write-test-'):
             pass
     except OSError:
-        raise RuntimeError(f'Скрипт не может работать из этой папки: {ROOT}\n'
-                           'Что сделать: закройте это окно, скопируйте всю папку CarrierSIM '
-                           'в «Загрузки» и запустите оттуда.') from None
+        raise RuntimeError(f'The script cannot run from this folder: {ROOT}\n'
+                           'Close this window, copy the entire CarrierSIM folder '
+                           'to Downloads, and launch it there.') from None
 
 
 # pyimg4 (pulled in by pymobiledevice3) requires these compressors, but CarrierSIM never
@@ -79,24 +79,24 @@ def install_dependencies(python, version):
 def python_environment():
     if FROZEN: return Path(sys.executable)
     if sys.version_info < (3, 11):
-        raise RuntimeError('Нужен Python 3.11 или новее: https://www.python.org/downloads/')
+        raise RuntimeError('Python 3.11 or newer is required: https://www.python.org/downloads/')
     if sys.platform == 'win32' and sys.maxsize <= 2**32:
-        raise RuntimeError('На Windows нужен Python x64.')
+        raise RuntimeError('Windows requires Python x64.')
     env = ROOT / '.venv'
     python = env / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
     current = '%d.%d' % sys.version_info[:2]
     for attempt in range(2):
         if not env.exists():
-            print('Создаю локальное окружение .venv…', flush=True)
+            print('Creating the local .venv environment…', flush=True)
             subprocess.run([sys.executable, '-m', 'venv', str(env)], check=True)
         if not python.is_file():
-            raise RuntimeError('Папка .venv неполная или создана на другой ОС. Переименуйте её и повторите запуск.')
+            raise RuntimeError('The .venv folder is incomplete or belongs to another OS. Rename it and launch again.')
         probe = subprocess.run([str(python), '-c',
             'import sys; assert sys.version_info >= (3,11); '
             'assert sys.platform != "win32" or sys.maxsize > 2**32; '
             'print("%d.%d" % sys.version_info[:2])'], capture_output=True, text=True)
         if probe.returncode:
-            raise RuntimeError('Python в .venv не подходит. Переименуйте папку .venv и повторите запуск.')
+            raise RuntimeError('Python in .venv is unsuitable. Rename the .venv folder and launch again.')
         version = probe.stdout.strip()
         dependencies = subprocess.run([str(python), '-c',
             'from importlib.metadata import version; '
@@ -109,95 +109,157 @@ def python_environment():
             break
         # A half-installed .venv from another Python (e.g. a failed 3.14 attempt) is rebuilt
         # with the interpreter the launcher picked; a working .venv is never touched.
-        print(f'Пересоздаю .venv: было Python {version}, теперь {current}…', flush=True)
+        print(f'Recreating .venv: Python {version} → {current}…', flush=True)
         shutil.rmtree(env)
-    print('Устанавливаю зависимости в .venv. Для этого нужен интернет…', flush=True)
+    print('Installing dependencies in .venv. Internet access is required…', flush=True)
     if not install_dependencies(python, tuple(map(int, version.split('.')))):
         if tuple(map(int, version.split('.'))) >= (3, 13):
-            raise RuntimeError(f'Не удалось установить зависимости для Python {version}.\n'
-                               'Что сделать: установите Python 3.12 с python.org '
-                               '(на Windows — «Windows installer (64-bit)» версии 3.12.10), '
-                               'старый Python удалять не нужно. Затем запустите скрипт снова.')
-        raise RuntimeError('Не удалось установить зависимости. Проверьте интернет и запустите скрипт снова.')
+            raise RuntimeError(f'Could not install dependencies for Python {version}.\n'
+                               'Install Python 3.12 from python.org '
+                               '(on Windows, use the Windows installer (64-bit) for 3.12.10). '
+                               'You do not need to remove your old Python. Then launch the script again.')
+        raise RuntimeError('Could not install dependencies. Check your internet connection and launch again.')
     return python
 
 
 def startup_banner():
     print('\n  CarrierSIM · ' + VERSION)
-    print('  Профили операторов · iPhone / iPad')
-    print('  VoWiFi / 5G / EVS  · Россия / Беларусь')
-    print('\n  Автор: Vladimir B / vlw · vlwwwwww@gmail.com', flush=True)
+    print('  Carrier profiles · iPhone / iPad')
+    print('  VoWiFi / 5G / EVS  · Russia / Belarus')
+    print('\n  Author: Vladimir B / vlw · vlwwwwww@gmail.com', flush=True)
 
 
 def menu(wifi=False):
     title = f'CarrierSIM · {VERSION}'
-    connection = 'Wi-Fi · эксперимент' if wifi else 'USB · кабель'
+    connection = 'Wi-Fi · experimental' if wifi else 'USB · cable'
     print('\n  ' + '─' * 50)
     print(f'  {title:<38}{connection}')
     print('  https://github.com/ios-bundles/CarrierSIM')
     print('  ' + '─' * 50)
-    print('\n  ПРОФИЛИ\n'
-          '   1  Установить профиль из bundle.yaml\n'
-          '   7  Выбрать другой профиль и SIM\n'
-          '   4  Вернуть штатный профиль\n'
-          '   5  Восстановить после сбоя\n\n'
-          '  ПРОВЕРКИ И ОТЧЁТЫ · только чтение\n'
-          '   2  Посмотреть SIM и план установки\n'
-          '   3  Проверить компьютер и файлы\n'
-          '   8  Диагностика связи · IMS, VoWiFi, ePDG, 5G\n'
-          '   9  Проверка звонка · канал и кодек\n'
-          '  11  Отчёт о профиле\n\n'
-          '  НАСТРОЙКИ И ПОМОЩЬ\n'
-          '  10  Переключить USB / Wi-Fi\n'
-          '   6  Справка\n'
-          '   0  Выход\n')
+    print('\n  PROFILES\n'
+          '   1  Install profiles from bundle.yaml\n'
+          '   7  Choose another profile and SIM\n'
+          '   4  Restore stock profile · IMSI only\n'
+          '   5  Recover after a failure\n'
+          '  12  Experimental GID1 override · USB only\n'
+          '  13  Undo GID1 override using run directory · USB only\n'
+          '  14  Automatic T-Mobile Wholesale installation · USB only\n'
+          '  15  Remove owned T-Mobile Wholesale installation · USB only\n\n'
+          '  CHECKS AND REPORTS · read-only\n'
+          '   2  View SIMs and installation plan\n'
+          '   3  Check computer and files\n'
+          '   8  Connection diagnostics · IMS, VoWiFi, ePDG, 5G\n'
+          '   9  Watch call · channel and codec\n'
+          '  11  Profile report\n\n'
+          '  SETTINGS AND HELP\n'
+          '  10  Switch USB / Wi-Fi\n'
+          '   6  Help\n'
+          '   0  Exit\n')
     while True:
-        choice = input('  Ваш выбор: ').strip()
+        choice = input('  Your choice: ').strip()
         if choice == '0': return None
         if choice == '1': return []
         if choice == '2': return ['--status']
         if choice == '3': return ['--check']
         if choice == '6': return ['--help']
-        if choice == '4': return ['--restore', '--sims', choose_sims('Для каких SIM вернуть штатный профиль?')]
+        if choice == '4': return ['--restore', '--sims', choose_sims('Which SIMs should use the stock profile?')]
         if choice == '5': return ['--recover']
         if choice == '7': return other_profile()
         if choice == '8': return ['--diagnose']
         if choice == '11': return ['--report']
         if choice == '9': return ['--watch-call']
         if choice == '10': return 'wifi'
-        print('Введите число от 0 до 11. Установка ещё не начата.')
+        if choice in ('12', '13'):
+            if wifi:
+                print('  GID1 apply and undo require USB. Switch to USB with menu 10 first.')
+                continue
+            return gid_override() if choice == '12' else undo_gid_override()
+        if choice in ('14', '15'):
+            if wifi:
+                print('  T-Mobile Wholesale installation and removal require USB. Switch with menu 10 first.')
+                continue
+            return wholesale_profile(remove=choice == '15')
+        print('Enter a number from 0 to 15. Installation has not started.')
 
 
 def other_profile():
-    print('\n  Имя системного пакета оператора на iPhone, как в /System/Library/Carrier Bundles/iPhone.\n'
-          '  Например: O2_Germany, Swisscom_ch, Vodafone_hu. Регистр букв важен.\n'
-          '  Этот профиль заменит bundle.yaml для выбранных SIM. Пустой ввод — вернуться в меню.')
+    print('\n  Enter the system carrier bundle name from /System/Library/Carrier Bundles/iPhone.\n'
+          '  Examples: O2_Germany, Swisscom_ch, Vodafone_hu. Names are case-sensitive.\n'
+          '  This overrides bundle.yaml for the selected SIMs. Leave blank to return to the menu.')
     while True:
-        name = input('  Профиль: ').strip().removesuffix('.bundle')
+        name = input('  Profile: ').strip().removesuffix('.bundle')
         if not name: return False
         if re.fullmatch(r'[A-Za-z0-9_]+', name): break
-        print('  Только латинские буквы, цифры и _. Например: O2_Germany.')
+        print('  Use only Latin letters, digits and _. Example: O2_Germany.')
     # A tuple asks main() to show the plan and the bundle passport first and write only after a yes.
-    return ('confirm', ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')])
+    return ('confirm', ['--bundle', name, '--sims', choose_sims('Which SIMs should use this profile?')])
 
 
-def ask_yes(question):
+def ask_yes(question, default_yes=True):
     while True:
         answer = input(question).strip().lower()
-        if answer in ('', 'д', 'да', 'y', 'yes'): return True
-        if answer in ('н', 'нет', 'n', 'no'): return False
-        print('  Введите «д» или «н».')
+        if not answer: return default_yes
+        if answer in ('y', 'yes'): return True
+        if answer in ('n', 'no'): return False
+        print('  Enter y/yes or n/no.')
 
 
 def choose_sims(question):
     print(f'\n  {question}\n'
           '  1  SIM 1\n'
           '  2  SIM 2\n'
-          '  Enter — обе (зарубежную SIM не трогает — выберите её номер)')
+          '  Enter — both. Installation skips unconfigured foreign SIMs unless their slot is selected.')
     while True:
         sims = input('  SIM: ').strip()
         if sims in ('', '1', '2'): return sims or 'all'
-        print('  Введите 1, 2 или нажмите Enter.')
+        print('  Enter 1, 2, or press Enter.')
+
+
+def gid_override():
+    print('\n  Experimental user-catalog GID1 alias. System bundles remain untouched.\n'
+          '  Selecting one SIM does not isolate a GID rule from other SIMs.\n'
+          '  The first service/reboot trial must end with undo. Blank input cancels.')
+    while True:
+        gid = input('  GID1 (hex, 1–16 bytes): ').strip()
+        if not gid: return False
+        if re.fullmatch(r'[0-9A-Fa-f]{2,32}', gid) and len(gid) % 2 == 0: break
+        print('  Enter 2–32 hex digits, with an even length.')
+    while True:
+        name = input('  Explicit system bundle name: ').strip().removesuffix('.bundle')
+        if not name: return False
+        if re.fullmatch(r'[A-Za-z0-9_]+', name): break
+        print('  Use only Latin letters, digits and _.')
+    while True:
+        slot = input('  Exactly one SIM slot (1 or 2; blank cancels): ').strip()
+        if not slot: return False
+        if slot in ('1', '2'): break
+        print('  Enter 1 or 2.')
+    return ('gid-confirm', ['--gid1', gid.upper(), '--bundle', name, '--sims', slot])
+
+
+def undo_gid_override():
+    directory = input('\n  GID1 operation run directory (blank cancels): ').strip()
+    if not directory: return False
+    return ('gid-confirm', ['--undo-gid1', directory])
+
+def wholesale_profile(remove=False):
+    print('\n  Remove only an owned T-Mobile Wholesale installation.' if remove else
+          '\n  Automatically identify an eligible T-Mobile SIM and install T-Mobile Wholesale.')
+    print('  Enter selects automatically; use 1 or 2 to select a specific SIM slot.\n'
+          '  A read-only preview runs before confirmation. No identifiers or run directory are needed.')
+    while True:
+        slot = input('  SIM slot (Enter — auto, 1 or 2): ').strip()
+        if slot in ('', '1', '2'): break
+        print('  Enter 1, 2, or press Enter for automatic selection.')
+    args = ['--remove-tmobile-wholesale' if remove else '--tmobile-wholesale']
+    if slot: args.extend(['--sims', slot])
+    return ('wholesale-confirm', args)
+
+
+
+def show_help():
+    # Parsing help exits before dependency imports or device discovery in carrier.py.
+    return run_carrier(Path(sys.executable), ['--help'])
 
 
 def main():
@@ -206,6 +268,8 @@ def main():
         import carrier
         return carrier.cli()
     os.chdir(ROOT)
+    if sys.argv[1:] in (['--help'], ['-h']):
+        return show_help()
     check_writable()
     python = None
     if len(sys.argv) > 1:
@@ -218,41 +282,57 @@ def main():
         if args is None: return 0
         if args is False: continue
         confirm = isinstance(args, tuple)
+        gid_confirm = confirm and args[0] == 'gid-confirm'
+        wholesale_confirm = confirm and args[0] == 'wholesale-confirm'
+        usb_confirm = gid_confirm or wholesale_confirm
         if confirm: args = args[1]
         if args == 'wifi':
             wifi = not wifi
             if wifi:
-                print('\n  Режим Wi-Fi: все действия с телефоном пойдут без кабеля.\n'
-                      '  Нужно заранее: доверие через кабель и в Finder/iTunes галка\n'
-                      '  «Показывать этот iPhone, если он подключён к Wi-Fi». Одна сеть с компьютером.\n'
-                      '  Сначала пункт 2, потом 1. Порядок проверки — в README, раздел про --wifi.')
+                print('\n  Wi-Fi mode: ordinary device actions use wireless transport.\n'
+                      '  First pair over USB and enable “Show this iPhone when on Wi-Fi”\n'
+                      '  in Finder/iTunes. Use the same network as the computer.\n'
+                      '  Start with menu 2, then 1. See the README section about --wifi.\n'
+                      '  GID1 and T-Mobile Wholesale installation/removal always require USB.')
             continue
-        if wifi and args not in (['--check'], ['--help']): args = [*args, '--wifi']
+        if usb_confirm and wifi:
+            print('This operation requires USB. Switch to USB with menu 10 first.')
+            continue
+        if args == ['--help']:
+            show_help()
+            input('\nPress Enter to return to the main menu…')
+            continue
+        if wifi and args != ['--check'] and not usb_confirm: args = [*args, '--wifi']
         print('\n' + '─' * 56, flush=True)
         try:
             if python is None: python = python_environment()
             env = {**os.environ, 'CARRIERSIM_MENU': '1'}
             code = run_carrier(python, [*args, '--status'], env={**env, 'CARRIERSIM_PLAN': '1'}) if confirm else 0
             if code == NOTHING_TO_WRITE:
-                print('\n  Записывать нечего, установка не запущена. Причина указана выше.'); code = 0
-            elif confirm and not code and not ask_yes('\n  Записать этот профиль? Enter или «д» — да, «н» — нет: '):
-                print('Установка не запущена.')
+                print('\n  Nothing to write; installation was not started. See the reason above.'); code = 0
+            elif confirm and not code and not ask_yes(
+                    '\n  Confirm this T-Mobile Wholesale installation/removal? y/yes confirms; Enter cancels [NO]: '
+                    if wholesale_confirm else
+                    '\n  Confirm this GID1 apply/undo operation? y/yes confirms; Enter cancels [NO]: ' if gid_confirm
+                    else '\n  Write this profile? Enter or y — yes, n — no: ',
+                    default_yes=not usb_confirm):
+                print('Operation cancelled; no write was started.')
             elif not code:
                 code = run_carrier(python, args, env=env)
             if code == UNCONFIRMED:
-                print('\nВыбор профиля не подтверждён. Подробности — в журнале операции.')
+                print('\nProfile selection was not confirmed. See the operation journal.')
             elif code:
-                print('\nДействие не завершено. Причина указана выше.')
+                print('\nThe action did not complete. See the reason above.')
         except Exception as error:
-            print('\nОшибка запуска:', str(error).strip() or type(error).__name__)
-        input('\nНажмите Enter, чтобы вернуться в главное меню…')
+            print('\nLaunch error:', str(error).strip() or type(error).__name__)
+        input('\nPress Enter to return to the main menu…')
 
 
 if __name__ == '__main__':
     try: sys.exit(main())
     except (KeyboardInterrupt, EOFError):
-        print('\nЗапуск прерван. Если запись уже началась, сохраните runs и используйте восстановление.')
+        print('\nLaunch interrupted. If writing had started, keep runs and use recovery.')
         sys.exit(130)
     except Exception as error:
-        print('Ошибка запуска:', str(error).strip() or type(error).__name__, file=sys.stderr)
+        print('Launch error:', str(error).strip() or type(error).__name__, file=sys.stderr)
         sys.exit(1)

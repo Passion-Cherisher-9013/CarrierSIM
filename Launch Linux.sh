@@ -9,7 +9,7 @@ for candidate in python3.12 python3.11 python3.13 python3.14 python3; do
     fi
 done
 if [ -z "$carrier_python" ]; then
-    echo 'Установите Python 3.11 или новее.'
+    echo 'Install Python 3.11 or newer.'
     exit 1
 fi
 exec "$carrier_python" -u launch.py "$@"
