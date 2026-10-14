@@ -1,6 +1,7 @@
 """Offline regression tests: temporary files and mocked device boundaries only."""
 import asyncio
 import contextlib
+import gc
 import io
 import json
 import pathlib
@@ -15,6 +16,42 @@ from unittest.mock import AsyncMock, patch
 import carrier
 import launch
 from carriersim_version import VERSION
+
+class AfcLifetimeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_send_disconnect_preserves_the_error_without_orphaned_response_futures(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        sending = asyncio.Event()
+        transport = SimpleNamespace(closed=False)
+
+        async def receive(size):
+            await sending.wait()
+            raise ConnectionTerminatedError()
+
+        async def send(data):
+            sending.set()
+            await service._afc_terminated.wait()
+            raise ConnectionResetError('Connection lost')
+
+        async def close():
+            transport.closed = True
+
+        transport.recvall, transport.sendall, transport.close = receive, send, close
+        device = SimpleNamespace(start_lockdown_service=AsyncMock(return_value=transport))
+        service = carrier.afc_service(device)
+        loop = asyncio.get_running_loop()
+        original_handler, failures = loop.get_exception_handler(), []
+        loop.set_exception_handler(lambda _, context: failures.append(context))
+        try:
+            async with service:
+                with self.assertRaises(ConnectionResetError):
+                    await service.stat('Books')
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(original_handler)
+        self.assertTrue(transport.closed)
+        self.assertEqual(failures, [])
+
 
 
 class LinuxBackendTest(unittest.TestCase):

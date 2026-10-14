@@ -140,12 +140,14 @@ Another active SIM on the same PLMN is conservatively refused.
 
 Catalog/Books backups, phone and SIM identity bindings, exact write/readback,
 and complete carrier/operator verification are required. All other enabled
-slots must remain at their baselines. After a carrier-switch connection loss
-following completed catalog write/readback, reconnect to the same phone,
-check catalog/identities, then require one fresh complete rescan. Never
-reapply the alias or accept partial logs. Genuine rejection still performs
-exact owned-entry rollback, preserving unrelated changes. Removal verifies
-through the analogous reconnect without writing/removing twice.
+slots must remain at their baselines. After completed catalog placement,
+a connection loss during readback OR the fresh rescan reconnects to the
+same phone. Repair an interrupted readback stage, then require an exact
+catalog/identity match and complete fresh carrier/operator verification.
+Never reapply the alias, repeat removal or accept partial logs. Genuine
+rejection still performs exact owned-entry rollback, preserving unrelated
+changes. AFC response futures are observed when the pinned SDK releases
+them; the original transport error is preserved without orphan warnings.
 
 A verified installation stays applied; no background program or connected
 computer is required afterward. The user reported the retained qualified
@@ -891,6 +893,20 @@ LOCAL CHANGES
   passed. Six isolated actual CLI/menu scenarios passed with device transport
   simulated; the user's retained manual qualified install has live evidence
   and reported working/reboot persistence.
+- Fixed the post-apply readback connection-loss gap, including interrupted
+  readback stages and the analogous removal path. AFC future ownership is
+  cleaned up without suppressing the original transport failure.
+  177 tests run, 2 skipped; suite passed. Before/after reproductions cover
+  readback disconnects and the pinned SDK's send/receive race. Actual CLI
+  smoke passed install, repeat/no-op and removal with injected disconnects.
+- Physical verification: repaired the failed owner and interrupted Books
+  stage, then completed a fresh automatic install despite a live rescan
+  connection drop. SIM 1: T-Mobile Wholesale 72.0; SIM 2: AT&T MVNO 72.0
+  unchanged. Both carrier/operator signatures verified. Read-only follow-up
+  confirmed unchanged phone/SIM identities, all four native stages restored,
+  live Books sync files matching backup and zero unfinished operations.
+  Repeat installation was a no-op; Wholesale remains applied. Calls, data
+  and reboot persistence were not re-tested in this session.
 
 LICENSE
 CarrierSIM's own code is MIT (LICENSE).

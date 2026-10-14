@@ -183,6 +183,32 @@ def staging_archive(payload=None):
             z.writestr(zi(name, kind, streaming=True), data)
     return b.getvalue()
 
+class _AfcPending(dict):
+    # SDK 11.12.5 can fail a response future while its sender is also failing.
+    # Observe response errors before the SDK drops ownership; awaiting still raises.
+    @staticmethod
+    def observe(future):
+        if future is not None and future.done() and not future.cancelled():
+            future.exception()
+
+    def pop(self, key, *default):
+        future = super().pop(key, *default)
+        self.observe(future)
+        return future
+
+    def clear(self):
+        for future in self.values():
+            self.observe(future)
+        super().clear()
+
+
+def afc_service(device):
+    from pymobiledevice3.services.afc import AfcService
+    service = AfcService(device)
+    service._afc_pending = _AfcPending()
+    return service
+
+
 async def exists(afc, path):
     from pymobiledevice3.exceptions import AfcFileNotFoundError
     try:
@@ -384,9 +410,8 @@ async def purge_outstanding(afc, run):
 
 
 async def clean_phone(device, run):
-    from pymobiledevice3.services.afc import AfcService
     report = {}
-    async with AfcService(device) as afc:
+    async with afc_service(device) as afc:
         for name in sorted(n for n in await afc.listdir('/') if LEFTOVER.fullmatch(n)):
             node = await afc.stat(name)
             if name.startswith('airlift-saved-') and node['st_ifmt'] == 'S_IFDIR':
@@ -633,7 +658,6 @@ class AirliftClosed(RuntimeError):
 
 
 async def transfer(device, run, payload=None, expected=None, recovery=False, before_commit=None):
-    from pymobiledevice3.services.afc import AfcService
     run.mkdir(parents=True, exist_ok=False)
     token = os.urandom(10).hex()
     source, link, exported = ('airlift-' + t + '-' + token for t in ('src', 'link', 'saved'))
@@ -653,7 +677,7 @@ async def transfer(device, run, payload=None, expected=None, recovery=False, bef
         save_json(run / 'journal.json', journal)
     phase('created')
     snapshot = None
-    async with network_timeout(NETWORK_TRANSFER_SECONDS), AfcService(device) as afc:
+    async with network_timeout(NETWORK_TRANSFER_SECONDS), afc_service(device) as afc:
         for path in (source, link, exported):
             require(await exists(afc, path) is None, 'Staging path collision')
         leftovers = sorted(n for n in await afc.listdir('/') if n.startswith('airlift-'))
@@ -1761,24 +1785,31 @@ async def gid_rescan(device, trigger, work, name, identities, *, require_operato
     return results
 
 
-async def gid_checked_rescan(device, trigger, work, name, identities, record, reconnect, expected_catalog):
+async def gid_checked_rescan(device, trigger, work, name, identities, record, reconnect, expected_catalog, *, readback_name):
     qualified = record.get('iccid_qualified', False)
+    readback = work / readback_name
     try:
+        current = await transfer(device, readback)
+        require(current == expected_catalog, 'Carrier catalog readback mismatch.')
         result = await gid_rescan(device, trigger, work, name, identities, require_operator=qualified)
         require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed during verification.')
-        return result
+        return current, result
     except Exception as error:
         if not isinstance(error, GidRescanConnectionError) and not gid_connection_lost(error):
             raise
-        print('Carrier change interrupted the connection. Reconnecting to verify the existing catalog; no alias reapply.', flush=True)
+        print('Carrier operation interrupted the connection. Reconnecting to verify the placed catalog; no alias reapply.', flush=True)
         record.setdefault('verification_connection_errors', []).append(error_line(error))
         device = await reconnect()
         require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed after reconnect.')
+        if readback in pending(work.parent, device.udid):
+            recovery = work / (readback_name + '-recovery')
+            recovery.mkdir()
+            await recover_stage(device, readback, recovery, alias_record=record)
         current = await transfer(device, work / (name + '-reconnect-catalog'))
         require(current == expected_catalog, 'The catalog changed during reconnect; verification stopped.')
         result = await gid_rescan(device, trigger, work, name + '-reconnected', identities, require_operator=qualified)
         require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed during fresh verification.')
-        return result
+        return current, result
 
 
 async def gid_repair_stages(device, owner, record, work, runs):
@@ -1813,10 +1844,10 @@ async def gid_remove(device, owner, record, work, trigger, runs, final_state, re
                 'Active SIM identities changed during undo; retry the journal-bound undo.')
     if desired != current:
         await transfer(device, work / 'undo', payload=desired, expected=current, before_commit=stable)
-    observed = await transfer(device, work / 'undo-readback')
+    observed, result = await gid_checked_rescan(device, trigger, work, 'undo-rescan', identities, record, reconnect,
+                                              desired, readback_name='undo-readback')
     require(observed == desired and (not record.get('ownership_established') or record['alias'] not in observed),
             'Alias removal could not be verified.')
-    result = await gid_checked_rescan(device, trigger, work, 'undo-rescan', identities, record, reconnect, observed)
     for slot, identity in identities.items():
         baseline = record.get('baseline', {}).get(slot)
         if record.get('ownership_established') and identity == record.get('identities', {}).get(slot) and baseline:
@@ -2017,8 +2048,8 @@ async def execute_gid(args, assets):
         record['state'] = 'apply_started'
         save_json(owner / 'gid-alias.json', record)
         await transfer(device, work / 'apply', payload=desired, expected=original, before_commit=stable)
-        require(await transfer(device, work / 'readback') == desired, 'Applied catalog readback mismatch.')
-        result = await gid_checked_rescan(device, trigger, work, 'rescan', identities, record, reconnect, desired)
+        _, result = await gid_checked_rescan(device, trigger, work, 'rescan', identities, record, reconnect,
+                                            desired, readback_name='readback')
         for current_slot in identities:
             for kind in ('carrier', 'operator') if iccid_qualified else ('carrier',):
                 current = result[current_slot] if kind == 'carrier' else result[current_slot]['operator']
@@ -2135,7 +2166,6 @@ EXPORT_SETTLE_SECONDS = 60
 
 
 async def recover_stage(device, failed, run, tag='', alias_record=None):
-    from pymobiledevice3.services.afc import AfcService
     record = read_json(failed/'journal.json'); bound(record,device)
     if record.get('recovered_by'):
         print('Stage already recovered:',record['recovered_by'],flush=True)
@@ -2145,7 +2175,7 @@ async def recover_stage(device, failed, run, tag='', alias_record=None):
     books = read_tree_zip(failed/'books.zip'); state=read_json(failed/'books.json')
     require(tree_hash(books)==state['hash'],'Books backup is damaged.')
     desired = None
-    async with AfcService(device) as afc:
+    async with afc_service(device) as afc:
         if alias_record and not record.get('complete') and record.get('phase') == 'final-authorized':
             final = (record['source'] + '/' + PAYLOAD_PATH if record.get('payload_hash') else record['exported'])
             require(await exists(afc, final) is None,

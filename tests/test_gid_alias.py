@@ -55,6 +55,7 @@ class Sandbox:
         self.trigger_error = False
         self.alias_commits = 0
         self.catalog_writes = 0
+        self.transfer_failures = {}
         self.info = dict(ProductType='iPhone19,2', DeviceClass='iPhone', HardwareModel='V63AP',
                          ProductVersion='27.0.1', BuildVersion='24A446', ActivationState='Activated',
                          TelephonyCapability=True)
@@ -136,6 +137,25 @@ class Sandbox:
     async def transfer(self, device, run, payload=None, expected=None, recovery=False, before_commit=None):
         self.connected(device)
         run.mkdir()
+        if failure := self.transfer_failures.pop(run.name, None):
+            phase, change = failure
+            journal = dict(target=carrier.TARGET, udid_hash=carrier.digest(device.udid.encode()),
+                           source='airlift-src-' + 'a' * 20, link='airlift-link-' + 'a' * 20,
+                           exported='airlift-saved-' + 'a' * 20, phase=phase, complete=False)
+            if phase == 'staging':
+                carrier.write_tree_zip(run / 'books.zip', {})
+                carrier.save_json(run / 'books.json', {'hash': carrier.tree_hash({}), 'existed': False})
+                journal['requires_recovery'] = True
+            carrier.save_json(run / 'journal.json', journal)
+            if change == 'catalog':
+                self.catalog['later-change'] = ('f', b'preserve this current change')
+            elif change == 'identity':
+                next(row for row in self.rows if row['MCC'] + row['MNC'] == '310240')[
+                    'IntegratedCircuitCardIdentity'] = '8901000000000000099'
+            elif change == 'device':
+                self.wrong_reconnect = True
+            device.disconnected = True
+            raise ConnectionResetError('Connection lost')
         if run.name == 'apply' and self.precommit:
             self.precommit()
         original = dict(self.catalog)
@@ -724,6 +744,67 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(sandbox.record()['verification_connection_errors'])
             self.assertEqual(sandbox.record()['result']['kTwo']['operator']['selected'], BUNDLE)
             self.assertTrue(all(client.closed for client in sandbox.clients))
+
+    async def test_completed_apply_readback_disconnect_finishes_without_reapplying(self):
+        for phase in ('created', 'staging'):
+            case = self.root / phase
+            case.mkdir()
+            with self.subTest(phase=phase), Sandbox(case) as sandbox:
+                sandbox.rows = [dict(ROWS[1], Slot='kOne'), dict(ROWS[0], Slot='kTwo')]
+                sandbox.transfer_failures['readback'] = (phase, None)
+                self.assertEqual(await sandbox.automatic(), 0)
+                self.assertEqual(sandbox.alias_commits, 1)
+                self.assertEqual(sandbox.catalog_writes, 1)
+                self.assertEqual(sandbox.catalog[sandbox.alias], carrier.bundle_link(BUNDLE))
+                self.assertTrue(carrier.gid_healthy(sandbox.record()))
+                self.assertEqual(sandbox.record()['result']['kOne']['operator']['selected'], BUNDLE)
+                self.assertEqual(sandbox.record()['result']['kTwo']['selected'], 'Verizon_LTE_US.bundle')
+                self.assertEqual(carrier.pending(case, sandbox.device.udid), [])
+                self.assertTrue(all(client.closed for client in sandbox.clients))
+
+    async def test_completed_removal_readback_disconnect_does_not_remove_twice(self):
+        for phase in ('created', 'staging'):
+            case = self.root / phase
+            case.mkdir()
+            with self.subTest(phase=phase), Sandbox(case) as sandbox:
+                await sandbox.automatic()
+                sandbox.transfer_failures['undo-readback'] = (phase, None)
+                self.assertEqual(await sandbox.remove(), 0)
+                self.assertNotIn(sandbox.alias, sandbox.catalog)
+                self.assertEqual(sandbox.catalog_writes, 2)
+                self.assertEqual(sandbox.record()['state'], 'undone')
+                self.assertTrue(sandbox.record()['rollback_verified'])
+                self.assertEqual(carrier.pending(case, sandbox.device.udid), [])
+
+    async def test_readback_reconnect_does_not_accept_changed_catalog_sim_or_phone(self):
+        for change in ('catalog', 'identity', 'device'):
+            case = self.root / change
+            case.mkdir()
+            with self.subTest(change=change), Sandbox(case) as sandbox:
+                sandbox.transfer_failures['readback'] = ('created', change)
+                with self.assertRaises(RuntimeError):
+                    await sandbox.automatic()
+                self.assertEqual(sandbox.alias_commits, 1)
+                self.assertFalse(carrier.gid_healthy(sandbox.record()))
+                if change == 'device':
+                    self.assertEqual(sandbox.catalog[sandbox.alias], carrier.bundle_link(BUNDLE))
+                    self.assertEqual(sandbox.record()['state'], 'rollback_required')
+                else:
+                    self.assertNotIn(sandbox.alias, sandbox.catalog)
+                    self.assertEqual(sandbox.record()['state'], 'rolled_back')
+                if change == 'catalog':
+                    self.assertEqual(sandbox.catalog['later-change'], ('f', b'preserve this current change'))
+
+    async def test_second_readback_disconnect_rolls_back_without_reapplying(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.transfer_failures.update(readback=('created', None),
+                                             **{'rescan-reconnect-catalog': ('created', None)})
+            with self.assertRaises(ConnectionResetError):
+                await sandbox.automatic()
+            self.assertEqual(sandbox.alias_commits, 1)
+            self.assertNotIn(sandbox.alias, sandbox.catalog)
+            self.assertEqual(sandbox.record()['state'], 'rolled_back')
+            self.assertEqual(carrier.pending(self.root, sandbox.device.udid), [])
 
     async def test_reconnected_verification_still_rejects_signature_target_other_slot_and_sim_changes(self):
         for mode in ('drop-signature', 'drop-reject', 'drop-other-slot', 'drop-sim', 'drop-twice'):
