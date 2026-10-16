@@ -1477,7 +1477,7 @@ async def auto_recover(args,failed,before):
 async def execute_with_retry(args,assets):
     # Once selected, reconnect only to this exact phone, even if a different phone appears.
     args.udid=await choose_device(args.udid,args.wait_seconds)
-    if (args.gid1 or args.undo_gid1 or args.tmobile_wholesale or args.remove_tmobile_wholesale):
+    if (args.gid1 or args.undo_gid1 or args.tmobile_wholesale or args.remove_tmobile_wholesale or args.cleanup_overrides):
         # Catalog placement is single-shot; only interrupted verification reconnects.
         return await execute_gid(args, assets)
     if args.diagnose or args.watch_call or args.report:
@@ -1521,6 +1521,7 @@ async def execute_with_retry(args,assets):
 # Experimental aliases live in the user catalog; system bundles remain untouched.
 GID_TERMINAL = {'undone', 'rolled_back', 'aborted'}
 TMOBILE_WHOLESALE = 'TMobile_Wholesale_US.bundle'
+GID_ICCID_ALIAS = re.compile(r'([0-9]{5,6})_GID1-((?:[0-9A-F]{2}){1,16})_ID-([0-9]{18,22})')
 
 
 def gid_connection_lost(error):
@@ -1591,24 +1592,33 @@ def gid_noop(args, message, owner=None):
     return NOTHING_TO_WRITE if args.status and os.environ.get('CARRIERSIM_PLAN') else 0
 
 
-def gid_wholesale_owners(args, device):
-    owners = []
-    for owner in gid_active(args.runs, device.udid):
-        saved = read_json(owner / 'gid-alias.json')
-        if (saved.get('bundle') == TMOBILE_WHOLESALE and saved.get('iccid_qualified')
-                and saved.get('ownership_established')
-                and saved.get('slot') in SLOT_CHOICES[args.sims]):
-            owners.append((owner, gid_record(owner, device)))
-    return owners
+def gid_owner_slot(record, identities):
+    original = record.get('identities', {}).get(record.get('slot'))
+    return next((slot for slot, identity in identities.items() if identity == original), None)
 
 
-def gid_wholesale_slot(rows, sims):
+def gid_owners(runs, device):
+    return [(owner, gid_record(owner, device)) for owner in gid_active(runs, device.udid)]
+
+
+def gid_selected_owners(owners, identities, sims):
+    if sims == 'all':
+        return owners
+    slots = SLOT_CHOICES[sims]
+    current = [(owner, saved) for owner, saved in owners if gid_owner_slot(saved, identities) in slots]
+    if current:
+        return current
+    # An inactive/removed profile has no current slot; only then use the saved slot.
+    return [(owner, saved) for owner, saved in owners
+            if gid_owner_slot(saved, identities) is None and saved.get('slot') in slots]
+
+
+def gid_wholesale_slots(rows, sims):
     candidates = [row for row in rows if row['Slot'] in SLOT_CHOICES[sims] and
                   row.get('CFBundleIdentifier') in ('com.apple.TMobile_MVNO_US', 'com.apple.TMobile_Wholesale_US')]
     require(candidates, 'No eligible T-Mobile SIM was found. Automatic installation requires a reported '
                        'TMobile_MVNO_US profile; other carriers are not changed.')
-    require(len(candidates) == 1, 'More than one eligible T-Mobile SIM was found. Select --sims 1 or --sims 2.')
-    return candidates[0]
+    return candidates
 
 
 def gid_owned_tree(tree, record):
@@ -1625,9 +1635,47 @@ def gid_owned_tree(tree, record):
     return desired
 
 
+def gid_wholesale_aliases(tree):
+    aliases = []
+    for name, entry in tree.items():
+        match = GID_ICCID_ALIAS.fullmatch(name)
+        if match is not None:
+            LOG_SECRETS[match[3]] = '<iccid>'
+            if entry == bundle_link(TMOBILE_WHOLESALE):
+                aliases.append(name)
+    return sorted(aliases)
+
+
+def gid_snapshot(run, record, device):
+    snapshot = read_tree_zip(run / 'snapshot' / 'original.zip')
+    require(tree_hash(snapshot) == record['before_hash'], 'The bound catalog backup is missing or damaged.')
+    stage = read_json(run / 'snapshot' / 'journal.json')
+    bound(stage, device)
+    require(stage.get('original_hash') == record['before_hash'], 'Wrong catalog backup.')
+    books = read_tree_zip(run / 'snapshot' / 'books.zip')
+    state = read_json(run / 'snapshot' / 'books.json')
+    require(tree_hash(books) == state.get('hash') == record.get('books_hash'), 'Wrong Books backup.')
+    return snapshot
+
+
 def gid_record(run, device):
     record = read_json(run / 'gid-alias.json')
     bound(record, device)
+    if record.get('kind') == 'wholesale-removal':
+        require(record.get('schema') == 1 and record.get('family') == DEVICE_FAMILY and
+                record.get('bundle') == TMOBILE_WHOLESALE and record.get('iccid_qualified') is True and
+                not record.get('ownership_established'), 'Invalid discovered Wholesale removal journal.')
+        aliases = record.get('aliases')
+        require(isinstance(aliases, list) and all(isinstance(name, str) for name in aliases),
+                'Invalid discovered alias list.')
+        if record.get('before_hash'):
+            snapshot = gid_snapshot(run, record, device)
+            require(bool(aliases) and aliases == gid_wholesale_aliases(snapshot),
+                    'Discovered aliases do not match the bound catalog backup.')
+        else:
+            require(not aliases and record.get('state') in ('planning', 'rollback_required', 'aborted'),
+                    'Discovered removal has no authorized catalog backup.')
+        return record
     base_alias = record.get('plmn', '') + '_GID1-' + normalize_gid1(record.get('gid1', ''))
     qualified = record.get('iccid_qualified', False)
     require(isinstance(qualified, bool), 'Invalid ICCID qualifier binding.')
@@ -1655,15 +1703,8 @@ def gid_record(run, device):
     require(record.get('link_hex') == bundle_link(record.get('bundle', ''))[1].hex(),
             'Saved alias bytes do not match the system bundle binding.')
     if record.get('before_hash'):
-        baseline = read_tree_zip(run / 'snapshot' / 'original.zip')
-        require(tree_hash(baseline) == record['before_hash'] and record['alias'] not in baseline,
-                'The bound catalog backup is missing or damaged.')
-        stage = read_json(run / 'snapshot' / 'journal.json')
-        bound(stage, device)
-        require(stage.get('original_hash') == record['before_hash'], 'Wrong catalog backup.')
-        books = read_tree_zip(run / 'snapshot' / 'books.zip')
-        state = read_json(run / 'snapshot' / 'books.json')
-        require(tree_hash(books) == state.get('hash') == record.get('books_hash'), 'Wrong Books backup.')
+        require(record['alias'] not in gid_snapshot(run, record, device),
+                'The bound catalog backup already contains the alias.')
     return record
 
 
@@ -1784,11 +1825,13 @@ async def gid_rescan(device, trigger, work, name, identities, *, require_operato
 
 async def gid_checked_rescan(device, trigger, work, name, identities, record, reconnect, expected_catalog, *, readback_name):
     qualified = record.get('iccid_qualified', False)
+    verify_selection = record.get('ownership_established', False) or record.get('kind') == 'wholesale-removal'
     readback = work / readback_name
     try:
         current = await transfer(device, readback)
         require(current == expected_catalog, 'Carrier catalog readback mismatch.')
-        result = await gid_rescan(device, trigger, work, name, identities, require_operator=qualified)
+        result = (await gid_rescan(device, trigger, work, name, identities, require_operator=qualified)
+                  if identities and verify_selection else {})
         require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed during verification.')
         return current, result
     except Exception as error:
@@ -1804,7 +1847,8 @@ async def gid_checked_rescan(device, trigger, work, name, identities, record, re
             await recover_stage(device, readback, recovery, alias_record=record)
         current = await transfer(device, work / (name + '-reconnect-catalog'))
         require(current == expected_catalog, 'The catalog changed during reconnect; verification stopped.')
-        result = await gid_rescan(device, trigger, work, name + '-reconnected', identities, require_operator=qualified)
+        result = (await gid_rescan(device, trigger, work, name + '-reconnected', identities, require_operator=qualified)
+                  if identities and verify_selection else {})
         require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed during fresh verification.')
         return current, result
 
@@ -1832,10 +1876,17 @@ async def gid_remove(device, owner, record, work, trigger, runs, final_state, re
     record.update(state='rollback_required', recovery_run=str(work))
     save_json(owner / 'gid-alias.json', record)
     await gid_repair_stages(device, owner, record, work, runs)
+    identities = gid_identities(await carrier_rows(device))
+    if identities and record.get('ownership_established'):
+        require(trigger is not None, 'A SIM became active during cleanup; retry with the current SIMs.')
+        check_trigger(trigger, {v['plmn'] for v in identities.values()}, (record['bundle'],))
+    # Another independently owned override may have changed a different SIM since
+    # this owner's installation. Preserve its current verified state, not old history.
+    before = (await gid_rescan(device, trigger, work, 'undo-baseline', identities,
+                               require_operator=record.get('iccid_qualified', False))
+              if identities and record.get('ownership_established') else {})
     current = await transfer(device, work / 'undo-snapshot')
     desired = gid_owned_tree(current, record)
-    identities = gid_identities(await carrier_rows(device))
-    check_trigger(trigger, {v['plmn'] for v in identities.values()}, (record['bundle'],))
     async def stable():
         require(gid_identities(await carrier_rows(device)) == identities,
                 'Active SIM identities changed during undo; retry the journal-bound undo.')
@@ -1845,32 +1896,153 @@ async def gid_remove(device, owner, record, work, trigger, runs, final_state, re
                                               desired, readback_name='undo-readback')
     require(observed == desired and (not record.get('ownership_established') or record['alias'] not in observed),
             'Alias removal could not be verified.')
-    for slot, identity in identities.items():
-        baseline = record.get('baseline', {}).get(slot)
-        if record.get('ownership_established') and identity == record.get('identities', {}).get(slot) and baseline:
-            require(result[slot]['resolved'] == baseline['resolved'],
-                    'The original SIM has not returned to its verified baseline selection.')
+    original_identity = record.get('identities', {}).get(record.get('slot'))
+    for slot, identity in (identities.items() if record.get('ownership_established') else ()):
+        expected = before[slot]
+        if record.get('ownership_established'):
             if record.get('iccid_qualified'):
-                require(result[slot]['operator']['resolved'] == baseline['operator']['resolved'],
-                        'The original SIM has not returned to its verified operator baseline.')
+                if identity == original_identity:
+                    expected = record['baseline'][record['slot']]
+            elif identity['plmn'] == record['plmn']:
+                original_slot = next((s for s, saved in record.get('identities', {}).items()
+                                      if saved == identity), None)
+                expected = record.get('baseline', {}).get(original_slot)
+        if expected is not None:
+            require(result[slot]['resolved'] == expected['resolved'],
+                    'The SIM did not return to its baseline or retain its unaffected selection.')
+            if record.get('iccid_qualified'):
+                require(result[slot]['operator']['resolved'] == expected['operator']['resolved'],
+                        'The SIM did not return to its operator baseline or retain its unaffected selection.')
     require(not any(p.parent.resolve() == work.resolve() for p in pending(runs, device.udid)),
             'Books or stage recovery is not verified.')
     record.update(state=final_state if record.get('ownership_established') else 'aborted',
                   alias_removed=record['alias'] not in observed, catalog_verified=True,
                   rollback_verified=True, undo_result=result,
+                  undo_selection_status=('no_active_sims' if not identities else
+                                         'verified' if record.get('ownership_established') else 'not_owned'),
+                  finished_at=datetime.now(timezone.utc).isoformat())
+    save_json(owner / 'gid-alias.json', record)
+
+
+async def gid_remove_discovered(device, owner, record, work, args, assets, info, reconnect, *, initial=False):
+    await gid_repair_stages(device, owner, record, work, args.runs)
+    if not record.get('before_hash'):
+        if not initial:
+            record.update(state='aborted', finished_at=datetime.now(timezone.utc).isoformat())
+            save_json(owner / 'gid-alias.json', record)
+            return
+        original = await transfer(device, owner / 'snapshot')
+        aliases = gid_wholesale_aliases(original)
+        if not aliases:
+            record.update(state='aborted', catalog_verified=True, finished_at=datetime.now(timezone.utc).isoformat())
+            save_json(owner / 'gid-alias.json', record)
+            return
+        record.update(state='prepared', aliases=aliases, before_hash=tree_hash(original),
+                      books_hash=read_json(owner / 'snapshot' / 'books.json')['hash'])
+        save_json(owner / 'gid-alias.json', record)
+        print(f"Discovered {len(aliases)} full-ICCID Wholesale rule(s); a fresh local backup is saved.", flush=True)
+    identities = gid_identities(await carrier_rows(device))
+    trigger = None
+    if identities:
+        trigger, record['trigger'] = gid_trigger(args, assets, work, info, identities, TMOBILE_WHOLESALE)
+        save_json(owner / 'gid-alias.json', record)
+    before = (await gid_rescan(device, trigger, work, 'undo-baseline', identities, require_operator=True)
+              if identities else {})
+    require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed before removal.')
+    current = await transfer(device, work / 'undo-snapshot')
+    desired = dict(current)
+    for alias in record['aliases']:
+        require(alias not in current or current[alias] == bundle_link(TMOBILE_WHOLESALE),
+                'A discovered alias was changed by another operation; refusing to remove it.')
+        desired.pop(alias, None)
+    async def stable():
+        require(gid_identities(await carrier_rows(device)) == identities, 'SIM identities changed before removal.')
+    record.update(state='removal_started', recovery_run=str(work))
+    save_json(owner / 'gid-alias.json', record)
+    if desired != current:
+        await transfer(device, work / 'undo', payload=desired, expected=current, before_commit=stable)
+    observed, result = await gid_checked_rescan(device, trigger, work, 'undo-rescan', identities, record,
+                                              reconnect, desired, readback_name='undo-readback')
+    require(observed == desired and not any(alias in observed for alias in record['aliases']),
+            'Discovered Wholesale removal could not be verified.')
+    affected = {(match[1], digest(match[3].encode()))
+                for alias in record['aliases'] if (match := GID_ICCID_ALIAS.fullmatch(alias))}
+    for slot, identity in identities.items():
+        if (identity['plmn'], identity['iccid_hash']) not in affected:
+            require(result[slot]['resolved'] == before[slot]['resolved'] and
+                    result[slot]['operator']['resolved'] == before[slot]['operator']['resolved'],
+                    'An unaffected SIM changed its carrier or operator selection.')
+    # Without the installing computer's history, do not invent an original
+    # bundle. Exact alias absence plus fresh, signed system selection is proof.
+    require(not any(p.parent.resolve() == work.resolve() for p in pending(args.runs, device.udid)),
+            'Books or stage recovery is not verified.')
+    record.update(state='undone', catalog_verified=True, rollback_verified=True, undo_result=result,
                   undo_selection_status='verified' if identities else 'no_active_sims',
                   finished_at=datetime.now(timezone.utc).isoformat())
     save_json(owner / 'gid-alias.json', record)
 
 
 async def execute_gid(args, assets):
+    if args.gid1 or args.undo_gid1:
+        return await execute_gid_one(args, assets)
+    require(CONNECTION == 'USB', 'GID and T-Mobile Wholesale installation/removal/cleanup require USB.')
+    device = await ready_device(args.udid, args.wait_seconds)
+    try:
+        info = await device_info(device)
+        configure_device(info)
+        require(info.get('DeviceClass') in ('iPhone', 'iPad') and info.get('ActivationState') == 'Activated',
+                'An activated iPhone or cellular iPad is required.')
+        identities = gid_identities(rows := await carrier_rows(device))
+        if args.tmobile_wholesale:
+            requests = [('install', row['Slot']) for row in gid_wholesale_slots(rows, args.sims)]
+        else:
+            owners = gid_owners(args.runs, device)
+            if not args.cleanup_overrides:
+                owners = [(owner, saved) for owner, saved in owners
+                          if saved.get('kind') == 'wholesale-removal' or
+                          saved.get('bundle') == TMOBILE_WHOLESALE and saved.get('iccid_qualified')
+                          and saved.get('ownership_established')]
+            owners = gid_selected_owners(owners, identities, args.sims)
+            requests = [('remove', owner) for owner, _ in reversed(owners)]
+            if args.sims == 'all':
+                requests.append(('discover', None))
+            if not requests:
+                return gid_noop(args, 'No selected owned overrides were found. Nothing was changed.')
+    finally:
+        await device.close()
+    completed = 0
+    noop_only = True
+    for action, target in requests:
+        current = argparse.Namespace(**vars(args))
+        current.cleanup_overrides = current.remove_tmobile_wholesale = False
+        if action == 'install':
+            current.sims = '1' if target == 'kOne' else '2'
+        else:
+            current.tmobile_wholesale = False
+            current.gid1 = None
+            current.undo_gid1 = target
+        try:
+            code = await execute_gid_one(current, assets, expected_identities=identities, discover=action == 'discover')
+        except BaseException:
+            if completed and not args.status:
+                print(f'{completed} earlier operation(s) completed and were not reversed; '
+                      'the failed operation has its own recovery journal.', flush=True)
+            raise
+        completed += 1
+        noop_only = noop_only and code == NOTHING_TO_WRITE
+    if args.status and noop_only and os.environ.get('CARRIERSIM_PLAN'):
+        return NOTHING_TO_WRITE
+    return 0
+
+
+async def execute_gid_one(args, assets, *, expected_identities=None, discover=False):
     require(CONNECTION == 'USB', 'GID and T-Mobile Wholesale installation/removal require USB.')
     device = await ready_device(args.udid, args.wait_seconds)
     owner = work = record = None
     trigger = None
     mutations_started = False
     automatic = args.tmobile_wholesale
-    undo = bool(args.undo_gid1 or args.remove_tmobile_wholesale)
+    undo = bool(args.undo_gid1)
     try:
         info = await device_info(device)
         configure_device(info)
@@ -1897,16 +2069,47 @@ async def execute_gid(args, assets):
 
         rows = await carrier_rows(device)
         identities = gid_identities(rows)
-        if args.remove_tmobile_wholesale:
-            owners = gid_wholesale_owners(args, device)
-            if not owners:
-                return gid_noop(args, 'No owned ICCID-qualified T-Mobile Wholesale installation was found. Nothing was changed.')
-            require(len(owners) == 1, 'More than one owned Wholesale installation was found. Select --sims 1 or --sims 2, '
-                                     'or use --undo-gid1 with the specific run directory.')
-            owner, record = owners[0]
-        elif undo:
+        if expected_identities is not None:
+            require(identities == expected_identities, 'SIM identities changed during the multi-SIM operation.')
+        if undo:
             owner = args.undo_gid1.resolve()
             record = gid_record(owner, device)
+            discover = record.get('kind') == 'wholesale-removal'
+        if discover:
+            print('All recognized full-ICCID Wholesale rules will be discovered on this phone,\n'
+                  'including other-computer installations and inactive or removed eSIMs.', flush=True)
+            if args.status:
+                print('Read-only preview: catalog discovery and a fresh local backup occur only after confirmation.\n'
+                      'No catalog export, trigger, Books staging or rule removal has occurred.', flush=True)
+                return 0
+            if not undo:
+                require(not pending(args.runs, device.udid) and not gid_pending(args.runs, device.udid),
+                        'Recover unfinished operations before discovering additional overrides.')
+            work = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'gid-' + uuid.uuid4().hex[:6])
+            work.mkdir(mode=0o700)
+            DIAG['run'] = work
+            save_environment(work)
+            if undo:
+                record.setdefault('work_runs', []).append(str(work))
+            else:
+                owner = work
+                record = dict(schema=1, kind='wholesale-removal', state='planning', target=TARGET,
+                              udid_hash=digest(device.udid.encode()), family=DEVICE_FAMILY,
+                              bundle=TMOBILE_WHOLESALE, iccid_qualified=True, aliases=[],
+                              identities=identities, work_runs=[str(work)],
+                              created_at=datetime.now(timezone.utc).isoformat())
+            save_json(owner / 'gid-alias.json', record)
+            mutations_started = True
+            await gid_remove_discovered(device, owner, record, work, args, assets, info, reconnect, initial=not undo)
+            if record['state'] == 'undone':
+                print('Discovered Wholesale rules removed; exact catalog and Books restoration verified.', flush=True)
+                if record['undo_selection_status'] == 'no_active_sims':
+                    print('No active SIMs: selection cannot be tested until a SIM is enabled.', flush=True)
+                else:
+                    print('Current carrier/operator selections and signatures verified.', flush=True)
+            else:
+                print('No additional removal was authorized; no matching rule was removed.', flush=True)
+            return 0
         if undo:
             print('Undo only the exact alias owned by:', owner, flush=True)
             print('Alias:', mask_ids(record['alias']), '→', record['bundle'], flush=True)
@@ -1925,10 +2128,13 @@ async def execute_gid(args, assets):
                 return 0
         else:
             if automatic:
-                selected_row = gid_wholesale_slot(rows, args.sims)
+                selected_rows = gid_wholesale_slots(rows, args.sims)
+                require(len(selected_rows) == 1, 'A single installation step must identify exactly one SIM.')
+                selected_row = selected_rows[0]
                 slot = selected_row['Slot']
-                matching = [(path, saved) for path, saved in gid_wholesale_owners(args, device)
-                            if saved['identities'][saved['slot']] == identities[slot]]
+                matching = [(path, saved) for path, saved in gid_owners(args.runs, device)
+                            if saved.get('bundle') == TMOBILE_WHOLESALE and saved.get('iccid_qualified')
+                            and gid_owner_slot(saved, identities) == slot]
                 require(len(matching) <= 1, 'Conflicting ownership journals exist for this SIM. Use explicit journal-bound undo.')
                 if matching:
                     installed_owner, installed = matching[0]
@@ -1960,7 +2166,14 @@ async def execute_gid(args, assets):
             if iccid_qualified and alias is not None:
                 alias += '_ID-' + iccid
             require(gid_identities(await carrier_rows(device)) == identities, 'SIM identifiers are unstable.')
-            require(not gid_active(args.runs, device.udid), 'Remove the previous GID installation before applying another.')
+            existing = gid_owners(args.runs, device)
+            require(all(gid_healthy(saved) for _, saved in existing),
+                    'Recover interrupted GID installations before adding another override.')
+            require(not existing or iccid_qualified and all(saved.get('iccid_qualified') for _, saved in existing),
+                    'Only full-ICCID-qualified overrides may coexist; remove an unqualified GID rule first.')
+            owned_iccids = [saved['identities'][saved['slot']]['iccid_hash'] for _, saved in existing]
+            require(len(owned_iccids) == len(set(owned_iccids)) and chosen['iccid_hash'] not in owned_iccids,
+                    'Conflicting or duplicate ownership exists for this SIM. Remove its existing override first.')
             require(not pending(args.runs, device.udid), 'Recover unfinished stages before applying a GID installation.')
             print('Selected:', sim_header(selected_row), '· ICCID ending', iccid[-4:], flush=True)
             if automatic:
@@ -1993,7 +2206,9 @@ async def execute_gid(args, assets):
                 save_json(owner / 'gid-alias.json', record)
         if warning := backup_warning(await cloud_backup(device)):
             print(warning, flush=True)
-        trigger, trigger_info = gid_trigger(args, assets, work, info, identities, record['bundle'] if undo else args.bundle)
+        trigger_info = None
+        if not undo or identities and record.get('ownership_established'):
+            trigger, trigger_info = gid_trigger(args, assets, work, info, identities, record['bundle'] if undo else args.bundle)
         baseline = None
         if automatic:
             # Discovery only installs an independently signed, non-overlapping trigger.
@@ -2012,14 +2227,18 @@ async def execute_gid(args, assets):
                           baseline=baseline, baseline_key=base_alias)
         if undo:
             record.setdefault('work_runs', []).append(str(work))
-        record['trigger'] = trigger_info
+        if trigger_info is not None:
+            record['trigger'] = trigger_info
         save_json(owner / 'gid-alias.json', record)
         if undo:
             mutations_started = True
             await gid_remove(device, owner, record, work, trigger, args.runs, 'undone', reconnect)
-            print('Owned GID alias removed; catalog and Books restoration verified.', flush=True)
-            print('Current slot selections verified.' if record['undo_selection_status'] == 'verified' else
-                  'No active SIMs: slot selection cannot be tested until a SIM is enabled.', flush=True)
+            print('Owned GID alias removed; catalog and Books restoration verified.' if record.get('ownership_established') else
+                  'Uncommitted operation cleaned up; unowned entries were preserved.', flush=True)
+            if record['undo_selection_status'] == 'verified':
+                print('Current slot selections verified.', flush=True)
+            elif record['undo_selection_status'] == 'no_active_sims':
+                print('No active SIMs: slot selection cannot be tested until a SIM is enabled.', flush=True)
             return 0
         if not automatic:
             record['state'] = 'baseline_started'
@@ -2073,15 +2292,18 @@ async def execute_gid(args, assets):
             if record['state'] == 'aborted':
                 print('Operation stopped before device changes; no recovery is needed.', flush=True)
             # Never repeat apply. Reconnect before scoped rollback so cleanup owns a live client.
-            if mutations_started and trigger is not None:
+            if mutations_started and (trigger is not None or undo or discover):
                 try:
                     await reconnect()
                     recovery = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'gid-rollback-' + uuid.uuid4().hex[:6])
                     recovery.mkdir(mode=0o700)
                     record['work_runs'].append(str(recovery))
                     save_json(owner / 'gid-alias.json', record)
-                    await gid_remove(device, owner, record, recovery, trigger, args.runs,
-                                     'undone' if undo else 'rolled_back', reconnect)
+                    if discover:
+                        await gid_remove_discovered(device, owner, record, recovery, args, assets, info, reconnect)
+                    else:
+                        await gid_remove(device, owner, record, recovery, trigger, args.runs,
+                                         'undone' if undo else 'rolled_back', reconnect)
                     print('Scoped rollback verified; unrelated current catalog entries were preserved.', flush=True)
                 except BaseException as rollback_error:
                     record.update(state='rollback_required', rollback_error=error_line(rollback_error))
@@ -3261,17 +3483,20 @@ def main():
     group.add_argument('--watch-call',action='store_true',help='listen during a test call: codec (EVS/AMR), access network; read-only')
     experiment = parser.add_mutually_exclusive_group()
     experiment.add_argument('--gid1', metavar='HEX', help='experimental PLMN/GID1 alias; requires explicit --bundle and --sims 1 or 2')
-    experiment.add_argument('--undo-gid1', type=Path, metavar='RUN_DIRECTORY', help='remove only the alias owned by this run journal; --status previews')
+    experiment.add_argument('--undo-gid1', type=Path, metavar='RUN_DIRECTORY', help='journal-bound alias removal or interrupted Wholesale-removal recovery; --status previews')
     experiment.add_argument('--tmobile-wholesale', action='store_true',
                             help='USB-only automatic T-Mobile Wholesale install: discover the matched GID1 key and qualify by full ICCID; --status previews')
     experiment.add_argument('--remove-tmobile-wholesale', action='store_true',
-                            help='USB-only explicit removal of an owned ICCID-qualified Wholesale installation; --status previews')
+                            help='USB-only Wholesale removal; all also discovers full-ICCID rules installed on another computer')
+    experiment.add_argument('--cleanup-overrides', action='store_true',
+                            help='USB-only cleanup of local GID overrides and discovered full-ICCID Wholesale rules, even with no SIMs')
     parser.add_argument('--gid1-iccid', action='store_true',
                         help='with --gid1, add the selected SIM’s full ICCID qualifier and verify carrier/operator selection')
     parser.add_argument('--bundle',metavar='BUNDLE',
                         help='use one system bundle for all selected SIMs instead of bundle.yaml, for example O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
-                        help='SIM slots: 1, 2 or all (default). T-Mobile automatic modes detect the sole eligible SIM/owned run; '
+                        help='SIM slots: 1, 2 or all (default). Wholesale all installs every eligible line; '
+                             'all removal also discovers phone-side Wholesale rules, while 1/2 removal uses local journals; '
                              'ordinary install skips foreign SIMs without their own bundle.yaml entry')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='custom signed IPCC instead of the included trigger; board and SIMs are checked')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='attempts after transient connection errors (default 3); GID apply never retries')
@@ -3285,13 +3510,17 @@ def main():
     args=parser.parse_args()
     if args.gid1_iccid and args.gid1 is None:
         parser.error('--gid1-iccid requires --gid1; undo derives qualifiers from its saved journal.')
-    if args.gid1 is not None or args.undo_gid1 is not None or args.tmobile_wholesale or args.remove_tmobile_wholesale:
+    if (args.gid1 is not None or args.undo_gid1 is not None or args.tmobile_wholesale
+            or args.remove_tmobile_wholesale or args.cleanup_overrides):
         if any((args.check, args.atc_probe, args.restore, args.restore_backup, args.recover,
                 args.report, args.diagnose, args.watch_call)):
             parser.error('GID and T-Mobile modes are incompatible with other write, recovery, diagnostic or check actions.')
         if args.wifi:
             parser.error('GID and T-Mobile installation/removal are USB-only; remove --wifi.')
-        if args.tmobile_wholesale or args.remove_tmobile_wholesale:
+        if args.cleanup_overrides:
+            if args.bundle or args.sims != 'all':
+                parser.error('--cleanup-overrides cleans all supported rules; do not supply --bundle or --sims 1/2.')
+        elif args.tmobile_wholesale or args.remove_tmobile_wholesale:
             if args.bundle:
                 parser.error('Automatic T-Mobile modes use a fixed saved/system bundle; do not supply --bundle.')
             if args.tmobile_wholesale:

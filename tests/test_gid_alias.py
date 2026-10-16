@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 from pathlib import Path
+import shutil
 import tempfile
 from types import SimpleNamespace
 import zipfile
@@ -52,6 +53,11 @@ class Sandbox:
         self.mode = 'accept'
         self.baseline_key = ALIAS
         self.iccid = ROWS[1]['IntegratedCircuitCardIdentity']
+        self.baseline_keys = {}
+        self.failure_modes = {}
+        self.system_bundles = {}
+        self.rescans = []
+        self.committed_aliases = []
         self.precommit = None
         self.trigger_error = False
         self.alias_commits = 0
@@ -65,7 +71,7 @@ class Sandbox:
         self.wrong_reconnect = False
         self.args = SimpleNamespace(udid=self.device.udid, wait_seconds=0, runs=root, trigger=None,
                                     gid1='69', gid1_iccid=False, undo_gid1=None, bundle=BUNDLE, sims='2', status=False,
-                                    tmobile_wholesale=False, remove_tmobile_wholesale=False,
+                                    tmobile_wholesale=False, remove_tmobile_wholesale=False, cleanup_overrides=False,
                                     attempts=4, diagnose=False, watch_call=False, report=False,
                                     recover=None, restore=False, restore_backup=None)
 
@@ -122,6 +128,30 @@ class Sandbox:
         self.connected(device)
         return copy.deepcopy(self.rows)
 
+    def row(self, iccid):
+        return next(row for row in self.rows if row['IntegratedCircuitCardIdentity'] == iccid)
+
+    def dual_mvno(self):
+        self.rows[0].update(MCC='310', MNC='240', CFBundleIdentifier='com.apple.TMobile_MVNO_US',
+                            InternationalMobileSubscriberIdentity='310240000000001')
+
+    def key(self, iccid):
+        return self.baseline_keys.get(iccid, self.baseline_key)
+
+    def qualified_alias(self, iccid):
+        return self.key(iccid) + '_ID-' + iccid
+
+    def selected_bundle(self, row):
+        if row['MCC'] + row['MNC'] != '310240':
+            return 'Verizon_LTE_US.bundle'
+        key = self.key(row['IntegratedCircuitCardIdentity'])
+        for alias in (key + '_ID-' + row['IntegratedCircuitCardIdentity'], key):
+            if alias in self.catalog:
+                kind, link = self.catalog[alias]
+                if kind == 'l':
+                    return Path(link.decode()).name
+        return self.system_bundles.get(row['IntegratedCircuitCardIdentity'], 'TMobile_MVNO_US.bundle')
+
     @property
     def alias(self):
         base = '310240_GID1-' + self.args.gid1 if self.args.gid1 else self.baseline_key
@@ -135,6 +165,11 @@ class Sandbox:
             selected = next((row for row in self.rows if row['Slot'] in carrier.SLOT_CHOICES[args.sims]), None)
             if selected is not None:
                 self.iccid = selected['IntegratedCircuitCardIdentity']
+        else:
+            eligible = [row for row in self.rows
+                        if row.get('CFBundleIdentifier') == 'com.apple.TMobile_MVNO_US']
+            if eligible:
+                self.iccid = eligible[0]['IntegratedCircuitCardIdentity']
         path = work / 'gid-trigger.ipcc'
         path.write_bytes(b'isolated transport boundary')
         return path, {'sha256': carrier.digest(path.read_bytes())}
@@ -180,99 +215,121 @@ class Sandbox:
             carrier.validate_tree(payload)
             self.catalog = dict(payload)
             self.catalog_writes += 1
-            if self.alias in payload and self.alias not in original:
-                self.alias_commits += 1
+            additions = [name for name in payload if '_GID1-' in name and name not in original]
+            self.alias_commits += len(additions)
+            self.committed_aliases.extend(additions)
         journal.update(phase='placement-observed', complete=True, requires_recovery=False, books_restored=True)
         carrier.save_json(run / 'journal.json', journal)
         return original
 
     async def rescan(self, device, trigger, stage):
         self.connected(device)
-        selected = BUNDLE if self.alias in self.catalog else 'TMobile_MVNO_US.bundle'
-        verification, other = 'Success', 'Verizon_LTE_US.bundle'
+        mode = self.failure_modes.get(self.iccid, self.mode)
+        self.rescans.append((stage.name, tuple(row['IntegratedCircuitCardIdentity'] for row in self.rows)))
         if stage.name == 'rescan':
-            if not self.mode.startswith('drop'):
+            if not mode.startswith('drop'):
                 self.catalog['later-change'] = ('f', b'preserve this current change')
-            if self.mode == 'interrupt':
+            if mode == 'interrupt':
                 raise KeyboardInterrupt()
-            if self.mode == 'missing':
+            if mode == 'missing':
                 return {'ipcc_installation_completed': True, 'log_error': 'stream lost'}
-            if self.mode == 'reject':
-                selected = 'TMobile_MVNO_US.bundle'
-            if self.mode == 'signature':
-                verification = 'Failed'
-            if self.mode == 'other-slot':
-                other = 'WrongOther.bundle'
-        if stage.name == 'rescan-reconnected':
-            if self.mode == 'drop-signature':
-                verification = 'Failed'
-            if self.mode == 'drop-reject':
-                selected = 'TMobile_MVNO_US.bundle'
-            if self.mode == 'drop-other-slot':
-                other = 'WrongOther.bundle'
-        operator, operator_verification, other_operator = selected, verification, other
-        if stage.name == 'rescan':
-            if self.mode == 'operator-reject':
-                operator = 'TMobile_MVNO_US.bundle'
-            if self.mode == 'operator-signature':
-                operator_verification = 'Failed'
-            if self.mode == 'operator-other-slot':
-                other_operator = 'WrongOther.bundle'
         text = ''
         for row in self.rows:
             index = 1 if row['Slot'] == 'kOne' else 2
+            iccid = row['IntegratedCircuitCardIdentity']
+            target = iccid == self.iccid
+            bundle = operator = self.selected_bundle(row)
+            verification = operator_verification = 'Success'
+            if stage.name in ('rescan', 'rescan-reconnected'):
+                if target:
+                    if mode in ('reject', 'drop-reject'):
+                        bundle = operator = 'TMobile_MVNO_US.bundle'
+                    if mode in ('signature', 'drop-signature'):
+                        verification = operator_verification = 'Failed'
+                    if mode == 'operator-reject':
+                        operator = 'TMobile_MVNO_US.bundle'
+                    if mode == 'operator-signature':
+                        operator_verification = 'Failed'
+                else:
+                    if mode in ('other-slot', 'drop-other-slot'):
+                        bundle = operator = 'WrongOther.bundle'
+                    if mode == 'operator-other-slot':
+                        operator = 'WrongOther.bundle'
+            if stage.name in ('undo-rescan', 'undo-rescan-reconnected'):
+                if target and mode == 'undo-carrier-signature':
+                    verification = 'Failed'
+                if target and mode == 'undo-operator-signature':
+                    operator_verification = 'Failed'
+                if not target and mode == 'undo-operator-other-slot':
+                    operator = 'WrongOther.bundle'
             tmobile = row['MCC'] + row['MNC'] == '310240'
-            qualified = self.args.gid1_iccid or self.args.tmobile_wholesale
-            target = tmobile and (not qualified or row['IntegratedCircuitCardIdentity'] == self.iccid)
-            fallback = 'Verizon_LTE_US.bundle'
-            if tmobile:
-                key = self.alias.split('_ID-', 1)[0]
-                if qualified:
-                    key += '_ID-' + row['IntegratedCircuitCardIdentity']
-                fallback = BUNDLE if key in self.catalog else 'TMobile_MVNO_US.bundle'
-            bundle, op = (selected, operator) if target else (
-                fallback if other == 'Verizon_LTE_US.bundle' else other,
-                fallback if other_operator == 'Verizon_LTE_US.bundle' else other_operator)
-            checked, op_checked = (verification, operator_verification) if target else ('Success', 'Success')
-            text += (baseline_log(bundle, self.baseline_key, index) if tmobile and stage.name == 'baseline' else
-                     bundle_block(index, bundle, checked))
-            if self.mode != 'operator-missing' or stage.name != 'rescan':
-                text += bundle_block(index, op, op_checked, kind='Operator')
+            text += (baseline_log(bundle, self.key(iccid), index) if tmobile and stage.name == 'baseline' else
+                     bundle_block(index, bundle, verification))
+            if mode != 'operator-missing' or stage.name != 'rescan':
+                text += bundle_block(index, operator, operator_verification, kind='Operator')
             row['CFBundleIdentifier'] = 'com.apple.' + bundle.removesuffix('.bundle')
-        if not self.rows:
-            text = 'CommCenter: Received command at the server: kMatchBundle\n'
+        # A phone with no active profiles may produce a genuinely empty selection log.
         (stage / 'commcenter.log').write_text(text, encoding='utf-8')
-        dropping = ((stage.name == 'rescan' and self.mode.startswith('drop') and self.mode != 'drop-undo') or
-                    (stage.name == 'undo-rescan' and self.mode == 'drop-undo') or
-                    (stage.name == 'rescan-reconnected' and self.mode == 'drop-twice'))
+        dropping = ((stage.name == 'rescan' and mode.startswith('drop') and mode != 'drop-undo') or
+                    (stage.name == 'undo-rescan' and mode == 'drop-undo') or
+                    (stage.name == 'rescan-reconnected' and mode == 'drop-twice'))
         if dropping:
-            if self.mode == 'drop-alias':
+            if mode == 'drop-alias':
                 self.catalog[self.alias] = ('l', b'not our alias any more')
-            if self.mode == 'drop-catalog':
+            if mode == 'drop-catalog':
                 self.catalog['later-change'] = ('f', b'preserve this current change')
-            if self.mode == 'drop-sim':
-                self.rows[1]['IntegratedCircuitCardIdentity'] = '8901000000000000099'
-            if self.mode == 'drop-device':
+            if mode == 'drop-sim':
+                self.row(self.iccid)['IntegratedCircuitCardIdentity'] = '8901000000000000099'
+            if mode == 'drop-device':
                 self.wrong_reconnect = True
             device.disconnected = True
             return {'ipcc_installation_completed': True, 'log_error': 'ConnectionTerminatedError',
                     'log_interrupted': True}
         return {'ipcc_installation_completed': True}
 
-    def owner(self):
-        return next(self.root.glob('*/gid-alias.json')).parent
+    def owner(self, iccid=ROWS[1]['IntegratedCircuitCardIdentity']):
+        wanted = carrier.digest(iccid.encode())
+        owners = []
+        for path in self.root.glob('*/gid-alias.json'):
+            record = carrier.read_json(path)
+            if record.get('kind') != 'gid1-alias':
+                continue
+            identity = record.get('identities', {}).get(record.get('slot'), {})
+            if identity.get('iccid_hash') == wanted:
+                owners.append(path.parent)
+        if len(owners) != 1:
+            raise AssertionError(f'Expected exactly one journal for the requested identity, found {len(owners)}')
+        return owners[0]
 
-    def record(self):
-        return carrier.read_json(self.owner() / 'gid-alias.json')
+    def record(self, iccid=ROWS[1]['IntegratedCircuitCardIdentity']):
+        return carrier.read_json(self.owner(iccid) / 'gid-alias.json')
+
+    def removal_owner(self):
+        owners = [path.parent for path in self.root.glob('*/gid-alias.json')
+                  if carrier.read_json(path).get('kind') == 'wholesale-removal']
+        if len(owners) != 1:
+            raise AssertionError(f'Expected exactly one removal journal, found {len(owners)}')
+        return owners[0]
+
+    def removal_record(self):
+        return carrier.read_json(self.removal_owner() / 'gid-alias.json')
+
+    async def resume_removal(self, generic=False):
+        args = SimpleNamespace(**vars(self.args))
+        args.gid1 = None
+        args.gid1_iccid = args.tmobile_wholesale = args.remove_tmobile_wholesale = args.cleanup_overrides = False
+        args.undo_gid1 = None if generic else self.removal_owner()
+        args.recover = Path('AUTO') if generic else None
+        return await carrier.execute_with_retry(args, None)
 
     async def apply(self):
         return await carrier.execute_with_retry(self.args, None)
 
-    async def undo(self):
+    async def undo(self, iccid=ROWS[1]['IntegratedCircuitCardIdentity']):
         args = SimpleNamespace(**vars(self.args))
-        args.gid1, args.undo_gid1 = None, self.owner()
+        args.gid1, args.undo_gid1 = None, self.owner(iccid)
         args.gid1_iccid = False
-        args.tmobile_wholesale = args.remove_tmobile_wholesale = False
+        args.tmobile_wholesale = args.remove_tmobile_wholesale = args.cleanup_overrides = False
         return await carrier.execute_with_retry(args, None)
 
     async def automatic(self, sims='all'):
@@ -282,11 +339,18 @@ class Sandbox:
         self.args.sims = sims
         return await self.apply()
 
-    async def remove(self, status=False):
+    async def remove(self, status=False, sims='all'):
         args = SimpleNamespace(**vars(self.args))
         args.gid1, args.undo_gid1 = None, None
-        args.gid1_iccid = args.tmobile_wholesale = False
-        args.remove_tmobile_wholesale, args.status = True, status
+        args.gid1_iccid = args.tmobile_wholesale = args.cleanup_overrides = False
+        args.remove_tmobile_wholesale, args.status, args.sims = True, status, sims
+        return await carrier.execute_with_retry(args, None)
+
+    async def cleanup(self, status=False, sims='all'):
+        args = SimpleNamespace(**vars(self.args))
+        args.gid1, args.undo_gid1 = None, None
+        args.gid1_iccid = args.tmobile_wholesale = args.remove_tmobile_wholesale = False
+        args.cleanup_overrides, args.status, args.sims = True, status, sims
         return await carrier.execute_with_retry(args, None)
 
 
@@ -677,7 +741,7 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                 sandbox.baseline_key = '310240_GID1-7A'
                 expected = sandbox.baseline_key + '_ID-' + selected['IntegratedCircuitCardIdentity']
                 self.assertEqual(await sandbox.automatic(sims), 0)
-                record = sandbox.record()
+                record = sandbox.record(selected['IntegratedCircuitCardIdentity'])
                 self.assertEqual(record['slot'], slot)
                 self.assertEqual(record['baseline_key'], sandbox.baseline_key)
                 self.assertEqual(sandbox.catalog[expected], carrier.bundle_link(BUNDLE))
@@ -694,7 +758,7 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sandbox.catalog_writes, 1)
                 self.assertEqual(await sandbox.remove(), 0)
                 self.assertNotIn(expected, sandbox.catalog)
-                self.assertEqual(sandbox.record()['state'], 'undone')
+                self.assertEqual(sandbox.record(selected['IntegratedCircuitCardIdentity'])['state'], 'undone')
                 self.assertEqual(selected['CFBundleIdentifier'], 'com.apple.TMobile_MVNO_US')
                 self.assertEqual(other, other_before)
                 self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
@@ -711,7 +775,7 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                     sandbox.mode = mode
                     with self.assertRaises(RuntimeError):
                         await sandbox.automatic(sims)
-                    record = sandbox.record()
+                    record = sandbox.record(ROWS[int(sims) - 1]['IntegratedCircuitCardIdentity'])
                     self.assertEqual(record['state'], 'rolled_back')
                     self.assertNotIn(record['alias'], sandbox.catalog)
                     self.assertEqual(sandbox.alias_commits, 1)
@@ -728,8 +792,8 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sandbox.catalog, sandbox.original)
             self.assertEqual(list(self.root.iterdir()), [])
 
-    async def test_automatic_unsupported_and_ambiguous_sims_fail_without_changes(self):
-        for kind in ('foreign', 'ambiguous', 'explicit-foreign', 'inactive'):
+    async def test_automatic_unsupported_or_inactive_sims_fail_without_changes(self):
+        for kind in ('foreign', 'explicit-foreign', 'inactive'):
             case = self.root / kind
             case.mkdir()
             with self.subTest(kind=kind), Sandbox(case) as sandbox:
@@ -738,9 +802,6 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                 sandbox.args.sims = 'all'
                 if kind == 'foreign':
                     sandbox.rows = sandbox.rows[:1]
-                elif kind == 'ambiguous':
-                    sandbox.rows[0].update(MCC='310', MNC='240', CFBundleIdentifier='com.apple.TMobile_MVNO_US',
-                                           InternationalMobileSubscriberIdentity='310240000000001')
                 else:
                     sandbox.args.sims = '1' if kind == 'explicit-foreign' else '2'
                     if kind == 'inactive':
@@ -777,18 +838,273 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sandbox.catalog, original_catalog)
             self.assertEqual((sandbox.owner() / 'gid-alias.json').read_bytes(), original_record)
 
-    async def test_automatic_stock_wholesale_is_an_unowned_noop_and_cannot_be_removed(self):
+    async def test_stock_wholesale_without_a_catalog_alias_is_not_removed_or_owned(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+            original = dict(sandbox.catalog)
+            self.assertEqual(await sandbox.automatic(), 0)
+            self.assertEqual(await sandbox.remove(), 0)
+            self.assertEqual(sandbox.catalog, original)
+            self.assertEqual(sandbox.catalog_writes, 0)
+            record = sandbox.removal_record()
+            self.assertEqual(record['state'], 'aborted')
+            self.assertEqual(record['aliases'], [])
+            self.assertFalse(record.get('ownership_established', False))
+
+    async def test_install_does_not_adopt_an_unowned_wholesale_alias_but_all_removal_can_remove_it(self):
         with Sandbox(self.root) as sandbox:
             sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
             sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
             original = dict(sandbox.catalog)
             self.assertEqual(await sandbox.automatic(), 0)
-            self.assertEqual(await sandbox.remove(), 0)
-            sandbox.args.status = True
-            with patch.dict(carrier.os.environ, CARRIERSIM_PLAN='1'):
-                self.assertEqual(await sandbox.remove(status=True), carrier.NOTHING_TO_WRITE)
             self.assertEqual(sandbox.catalog, original)
+            self.assertEqual(sandbox.catalog_writes, 0)
             self.assertEqual(list(self.root.iterdir()), [])
+            self.assertEqual(await sandbox.remove(), 0)
+            self.assertNotIn(QUALIFIED_ALIAS, sandbox.catalog)
+            self.assertEqual(sandbox.catalog_writes, 1)
+            records = [carrier.read_json(path) for path in self.root.glob('*/gid-alias.json')]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['kind'], 'wholesale-removal')
+            self.assertFalse(records[0].get('ownership_established', False))
+
+    async def test_all_removal_without_history_preserves_exact_non_wholesale_and_malformed_entries(self):
+        with Sandbox(self.root) as sandbox:
+            link = carrier.bundle_link(BUNDLE)
+            iccid = ROWS[1]['IntegratedCircuitCardIdentity']
+            lookalikes = {
+                ALIAS: link,
+                '3102_GID1-69_ID-' + iccid: link,
+                '3102400_GID1-69_ID-' + iccid: link,
+                '310240_GID1-6_ID-' + iccid: link,
+                '310240_GID1-ab_ID-' + iccid: link,
+                '310240_GID1-' + 'AB' * 17 + '_ID-' + iccid: link,
+                '310240_GID1-_ID-' + iccid: link,
+                ALIAS + '_ID-' + '8' * 17: link,
+                ALIAS + '_ID-' + '8' * 23: link,
+                QUALIFIED_ALIAS + '-extra': link,
+                'nested': ('d', b''),
+                'nested/' + QUALIFIED_ALIAS: link,
+                '310240_IMSI-310240000000002': link,
+                '310240_GID1-68_ID-' + iccid: carrier.bundle_link('TMobile_MVNO_US.bundle'),
+                '310240_GID1-67_ID-' + iccid: ('f', link[1]),
+                '310240_GID1-66_ID-' + iccid: ('l', b'../TMobile_Wholesale_US.bundle'),
+            }
+            # The unqualified rule is not selected by this active line.
+            sandbox.baseline_key = '310240_GID1-70'
+            selected = sandbox.qualified_alias(iccid)
+            sandbox.catalog.update(lookalikes)
+            sandbox.catalog[selected] = link
+            sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+            sandbox.system_bundles[iccid] = 'TMobile_US.bundle'
+            expected = dict(sandbox.catalog)
+            expected.pop(selected)
+            self.assertEqual(list(self.root.iterdir()), [])
+            self.assertEqual(await sandbox.remove(), 0)
+            self.assertEqual(sandbox.catalog, expected)
+            self.assertEqual(sandbox.catalog_writes, 1)
+            self.assertEqual(sandbox.row(iccid)['CFBundleIdentifier'], 'com.apple.TMobile_US')
+            self.assertEqual(sandbox.rows[0], ROWS[0])
+            record = sandbox.removal_record()
+            self.assertFalse(record.get('ownership_established', False))
+            self.assertEqual(record['state'], 'undone')
+            self.assertTrue(record['catalog_verified'])
+            self.assertTrue(record['rollback_verified'])
+            self.assertEqual(record['aliases'], [selected])
+            for slot, bundle in (('kOne', 'Verizon_LTE_US.bundle'), ('kTwo', 'TMobile_US.bundle')):
+                proof = record['undo_result'][slot]
+                self.assertEqual(proof['selected'], bundle)
+                self.assertTrue(proof['verified'])
+                self.assertEqual(proof['operator']['selected'], bundle)
+                self.assertTrue(proof['operator']['verified'])
+            self.assertEqual([carrier.read_json(path).get('kind')
+                              for path in self.root.glob('*/gid-alias.json')], ['wholesale-removal'])
+
+    async def test_all_removal_discovers_both_active_same_plmn_profiles_and_an_inactive_profile(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            aliases = [sandbox.qualified_alias(row['IntegratedCircuitCardIdentity']) for row in sandbox.rows]
+            aliases.append('310240_GID1-FA69_ID-8901000000000000099')
+            sandbox.catalog.update({alias: carrier.bundle_link(BUNDLE) for alias in aliases})
+            for row in sandbox.rows:
+                row['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+            self.assertEqual(await sandbox.remove(), 0)
+            self.assertEqual(sandbox.catalog, sandbox.original)
+            self.assertEqual(sandbox.catalog_writes, 1)
+            self.assertTrue(all(row['CFBundleIdentifier'] == 'com.apple.TMobile_MVNO_US'
+                                for row in sandbox.rows))
+            record = sandbox.removal_record()
+            self.assertFalse(record.get('ownership_established', False))
+            self.assertEqual(record['aliases'], sorted(aliases))
+            for proof in record['undo_result'].values():
+                self.assertEqual(proof['selected'], 'TMobile_MVNO_US.bundle')
+                self.assertEqual(proof['operator']['selected'], 'TMobile_MVNO_US.bundle')
+                self.assertTrue(proof['verified'])
+                self.assertTrue(proof['operator']['verified'])
+            self.assertEqual(carrier.gid_pending(self.root, sandbox.device.udid), [])
+
+    async def test_all_removal_without_active_sims_uses_catalog_and_books_proof_without_a_trigger(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.rows = []
+            aliases = ['31024_GID1-00_ID-' + '8' * 18,
+                       '310240_GID1-' + 'AB' * 16 + '_ID-' + '9' * 22]
+            sandbox.catalog.update({alias: carrier.bundle_link(BUNDLE) for alias in aliases})
+            sandbox.trigger_error = True
+            with patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.remove(), 0)
+            self.assertEqual(sandbox.catalog, sandbox.original)
+            self.assertEqual(sandbox.catalog_writes, 1)
+            self.assertEqual(sandbox.rescans, [])
+            record = sandbox.removal_record()
+            self.assertEqual(record['state'], 'undone')
+            self.assertEqual(record['undo_selection_status'], 'no_active_sims')
+            self.assertEqual(record['undo_result'], {})
+            self.assertTrue(record['catalog_verified'])
+            self.assertTrue(record['rollback_verified'])
+            self.assertEqual(carrier.pending(self.root, sandbox.device.udid), [])
+            self.assertEqual(carrier.gid_pending(self.root, sandbox.device.udid), [])
+
+    async def test_all_removal_and_cleanup_previews_without_history_are_genuinely_read_only(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
+            before = dict(sandbox.catalog)
+            with patch.object(carrier, 'transfer', side_effect=AssertionError('Unexpected catalog operation')), \
+                    patch.object(carrier, 'gid_trigger', side_effect=AssertionError('Unexpected trigger staging')), \
+                    patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.remove(status=True), 0)
+                self.assertEqual(await sandbox.cleanup(status=True), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(list(self.root.iterdir()), [])
+            self.assertEqual(sandbox.catalog_writes, 0)
+            self.assertEqual(sandbox.rescans, [])
+
+    async def test_explicit_slot_removal_does_not_discover_or_adopt_a_remote_alias(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
+            before = dict(sandbox.catalog)
+            with patch.object(carrier, 'transfer', side_effect=AssertionError('Unexpected catalog operation')), \
+                    patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.remove(sims='2'), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(list(self.root.iterdir()), [])
+            self.assertEqual(sandbox.catalog_writes, 0)
+            sandbox.dual_mvno()
+            sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+            await sandbox.automatic('1')
+            owner = sandbox.owner(ROWS[0]['IntegratedCircuitCardIdentity'])
+            self.assertEqual(await sandbox.remove(sims='1'), 0)
+            self.assertNotIn(sandbox.qualified_alias(ROWS[0]['IntegratedCircuitCardIdentity']), sandbox.catalog)
+            self.assertEqual(sandbox.catalog[QUALIFIED_ALIAS], carrier.bundle_link(BUNDLE))
+            self.assertEqual(sandbox.rows[1]['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+            record = carrier.read_json(owner / 'gid-alias.json')
+            self.assertEqual(record['undo_result']['kTwo']['selected'], BUNDLE)
+            self.assertEqual(record['undo_result']['kTwo']['operator']['selected'], BUNDLE)
+            self.assertEqual([path.parent for path in self.root.glob('*/gid-alias.json')], [owner])
+
+    async def test_removal_recovery_uses_only_saved_authorization_and_preserves_new_matching_aliases(self):
+        for generic in (False, True):
+            case = self.root / str(generic)
+            case.mkdir()
+            with self.subTest(generic=generic), Sandbox(case) as sandbox:
+                sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
+                sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+                sandbox.trigger_error = True
+                with self.assertRaises(RuntimeError):
+                    await sandbox.remove()
+                record = sandbox.removal_record()
+                self.assertEqual(record['state'], 'rollback_required')
+                self.assertEqual(record['aliases'], [QUALIFIED_ALIAS])
+                self.assertEqual(sandbox.catalog_writes, 0)
+                owner = sandbox.removal_owner()
+                backup = carrier.read_tree_zip(owner / 'snapshot' / 'original.zip')
+                self.assertEqual(backup[QUALIFIED_ALIAS], carrier.bundle_link(BUNDLE))
+                later = '310240_GID1-FA69_ID-8901000000000000099'
+                sandbox.catalog[later] = carrier.bundle_link(BUNDLE)
+                sandbox.catalog['later-file'] = ('f', b'preserve subsequent user changes')
+                expected = dict(sandbox.catalog)
+                expected.pop(QUALIFIED_ALIAS)
+                sandbox.trigger_error = False
+                self.assertEqual(await sandbox.resume_removal(generic=generic), 0)
+                self.assertEqual(sandbox.catalog, expected)
+                self.assertEqual(sandbox.catalog_writes, 1)
+                record = sandbox.removal_record()
+                self.assertEqual(record['aliases'], [QUALIFIED_ALIAS])
+                self.assertEqual(record['state'], 'undone')
+                self.assertTrue(record['rollback_verified'])
+                self.assertFalse(record.get('ownership_established', False))
+                self.assertEqual(record['undo_result']['kTwo']['selected'], 'TMobile_MVNO_US.bundle')
+                self.assertEqual(record['undo_result']['kTwo']['operator']['selected'], 'TMobile_MVNO_US.bundle')
+                self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
+
+    async def test_removal_recovery_rejects_corrupt_backups_changed_aliases_and_expanded_authorization(self):
+        for fault in ('catalog-backup', 'books-backup', 'changed-alias', 'expanded-authorization'):
+            case = self.root / fault
+            case.mkdir()
+            with self.subTest(fault=fault), Sandbox(case) as sandbox:
+                sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
+                sandbox.trigger_error = True
+                with self.assertRaises(RuntimeError):
+                    await sandbox.remove()
+                owner = sandbox.removal_owner()
+                if fault in ('catalog-backup', 'books-backup'):
+                    name = 'original.zip' if fault == 'catalog-backup' else 'books.zip'
+                    with zipfile.ZipFile(owner / 'snapshot' / name, 'a') as backup:
+                        backup.writestr(carrier.zi('unexpected-backup-entry', 'f'), b'valid ZIP, wrong tree hash')
+                elif fault == 'changed-alias':
+                    sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link('TMobile_MVNO_US.bundle')
+                else:
+                    later = '310240_GID1-FA69_ID-8901000000000000099'
+                    sandbox.catalog[later] = carrier.bundle_link(BUNDLE)
+                    record = sandbox.removal_record()
+                    record['aliases'] = sorted(record['aliases'] + [later])
+                    carrier.save_json(owner / 'gid-alias.json', record)
+                before = dict(sandbox.catalog)
+                sandbox.trigger_error = False
+                with self.assertRaises((RuntimeError, zipfile.BadZipFile)):
+                    await sandbox.resume_removal()
+                self.assertEqual(sandbox.catalog, before)
+                self.assertEqual(sandbox.catalog_writes, 0)
+                self.assertNotEqual(sandbox.removal_record()['state'], 'undone')
+
+    async def test_discovered_removal_disconnect_verifies_without_replaying_catalog_writes(self):
+        for boundary in ('readback', 'selection'):
+            case = self.root / boundary
+            case.mkdir()
+            with self.subTest(boundary=boundary), Sandbox(case) as sandbox:
+                sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
+                sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+                if boundary == 'readback':
+                    sandbox.transfer_failures['undo-readback'] = ('staging', None)
+                else:
+                    sandbox.mode = 'drop-undo'
+                self.assertEqual(await sandbox.remove(), 0)
+                self.assertEqual(sandbox.catalog, sandbox.original)
+                self.assertEqual(sandbox.catalog_writes, 1)
+                self.assertEqual(sandbox.alias_commits, 0)
+                record = sandbox.removal_record()
+                self.assertEqual(record['state'], 'undone')
+                self.assertTrue(record['verification_connection_errors'])
+                self.assertTrue(record['rollback_verified'])
+                self.assertEqual(record['undo_result']['kTwo']['operator']['selected'], 'TMobile_MVNO_US.bundle')
+                self.assertEqual(carrier.pending(case, sandbox.device.udid), [])
+                self.assertTrue(all(client.closed for client in sandbox.clients))
+
+    async def test_discovered_removal_requires_signed_carrier_operator_and_unchanged_unaffected_selection(self):
+        for mode in ('undo-carrier-signature', 'undo-operator-signature', 'undo-operator-other-slot'):
+            case = self.root / mode
+            case.mkdir()
+            with self.subTest(mode=mode), Sandbox(case) as sandbox:
+                sandbox.catalog[QUALIFIED_ALIAS] = carrier.bundle_link(BUNDLE)
+                sandbox.rows[1]['CFBundleIdentifier'] = 'com.apple.TMobile_Wholesale_US'
+                sandbox.mode = mode
+                with self.assertRaises(RuntimeError):
+                    await sandbox.remove()
+                self.assertEqual(sandbox.catalog, sandbox.original)
+                self.assertEqual(sandbox.catalog_writes, 1)
+                record = sandbox.removal_record()
+                self.assertEqual(record['state'], 'rollback_required')
+                self.assertFalse(record.get('rollback_verified', False))
+                self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [sandbox.removal_owner()])
 
     async def test_automatic_removal_is_scoped_and_can_find_ownership_after_the_sim_is_removed(self):
         with Sandbox(self.root) as sandbox:
@@ -948,6 +1264,389 @@ class GidTransactionTest(unittest.IsolatedAsyncioTestCase):
                 await sandbox.automatic()
             self.assertEqual(sandbox.catalog, original)
             self.assertEqual(sandbox.alias_commits, 1)
+
+    async def test_batch_all_installs_two_independent_same_plmn_owners_and_reruns_without_writes(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            self.assertEqual(await sandbox.automatic(), 0)
+            iccids = [row['IntegratedCircuitCardIdentity'] for row in ROWS]
+            aliases = {sandbox.qualified_alias(iccid) for iccid in iccids}
+            self.assertEqual(set(sandbox.committed_aliases), aliases)
+            self.assertEqual(sandbox.catalog_writes, 2)
+            self.assertEqual(len(set(sandbox.owner(iccid) for iccid in iccids)), 2)
+            for iccid in iccids:
+                self.assertTrue(carrier.gid_healthy(sandbox.record(iccid)))
+                self.assertEqual(sandbox.catalog[sandbox.qualified_alias(iccid)], carrier.bundle_link(BUNDLE))
+                self.assertEqual(sandbox.row(iccid)['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+            before = dict(sandbox.catalog)
+            journals = {iccid: (sandbox.owner(iccid) / 'gid-alias.json').read_bytes() for iccid in iccids}
+            with patch.object(carrier, 'transfer', side_effect=AssertionError('Unexpected catalog operation')), \
+                    patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.automatic(), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual({iccid: (sandbox.owner(iccid) / 'gid-alias.json').read_bytes()
+                              for iccid in iccids}, journals)
+            self.assertEqual(carrier.gid_pending(self.root, sandbox.device.udid), [])
+
+    async def test_sequential_manual_and_automatic_qualified_owners_use_each_identitys_matched_key(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            first, second = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+            sandbox.args.gid1_iccid, sandbox.args.sims = True, '1'
+            self.assertEqual(await sandbox.apply(), 0)
+            first_record = (sandbox.owner(first) / 'gid-alias.json').read_bytes()
+            sandbox.baseline_keys[second] = '310240_GID1-7A'
+            self.assertEqual(await sandbox.automatic('2'), 0)
+            self.assertEqual(sandbox.record(first)['baseline_key'], ALIAS)
+            self.assertEqual(sandbox.record(second)['baseline_key'], '310240_GID1-7A')
+            self.assertEqual(sandbox.record(second)['baseline']['kOne']['selected'], BUNDLE)
+            self.assertEqual(sandbox.record(second)['baseline']['kOne']['operator']['selected'], BUNDLE)
+            self.assertEqual((sandbox.owner(first) / 'gid-alias.json').read_bytes(), first_record)
+            self.assertEqual(sandbox.alias_commits, 2)
+            for iccid in (first, second):
+                self.assertEqual(sandbox.catalog[sandbox.qualified_alias(iccid)], carrier.bundle_link(BUNDLE))
+                self.assertTrue(carrier.gid_healthy(sandbox.record(iccid)))
+
+    async def test_removing_either_owner_first_preserves_the_other_current_carrier_and_operator(self):
+        for order in (('1', '2'), ('2', '1')):
+            case = self.root / ''.join(order)
+            case.mkdir()
+            with self.subTest(order=order), Sandbox(case) as sandbox:
+                sandbox.dual_mvno()
+                await sandbox.automatic()
+                first = ROWS[int(order[0]) - 1]['IntegratedCircuitCardIdentity']
+                other = ROWS[int(order[1]) - 1]['IntegratedCircuitCardIdentity']
+                other_slot = 'kOne' if order[1] == '1' else 'kTwo'
+                other_journal = (sandbox.owner(other) / 'gid-alias.json').read_bytes()
+                self.assertEqual(await sandbox.remove(sims=order[0]), 0)
+                self.assertNotIn(sandbox.qualified_alias(first), sandbox.catalog)
+                self.assertEqual(sandbox.record(first)['state'], 'undone')
+                self.assertEqual(sandbox.record(first)['undo_result'][other_slot]['selected'], BUNDLE)
+                self.assertEqual(sandbox.record(first)['undo_result'][other_slot]['operator']['selected'], BUNDLE)
+                self.assertEqual(sandbox.row(first)['CFBundleIdentifier'], 'com.apple.TMobile_MVNO_US')
+                self.assertEqual(sandbox.row(other)['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+                self.assertEqual(sandbox.catalog[sandbox.qualified_alias(other)], carrier.bundle_link(BUNDLE))
+                self.assertEqual((sandbox.owner(other) / 'gid-alias.json').read_bytes(), other_journal)
+                self.assertEqual(await sandbox.remove(sims=order[1]), 0)
+                self.assertNotIn(sandbox.qualified_alias(other), sandbox.catalog)
+                self.assertEqual(sandbox.record(other)['state'], 'undone')
+                self.assertEqual(sandbox.catalog['310240_GID1-54'], sandbox.original['310240_GID1-54'])
+                self.assertTrue(all(row['CFBundleIdentifier'] == 'com.apple.TMobile_MVNO_US'
+                                    for row in sandbox.rows))
+
+    async def test_all_removal_includes_inactive_owners_without_disturbing_foreign_lines(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            await sandbox.automatic()
+            sandbox.rows = [copy.deepcopy(ROWS[0])]
+            foreign = dict(sandbox.rows[0])
+            self.assertEqual(await sandbox.remove(), 0)
+            for row in ROWS:
+                iccid = row['IntegratedCircuitCardIdentity']
+                self.assertNotIn(sandbox.qualified_alias(iccid), sandbox.catalog)
+                self.assertEqual(sandbox.record(iccid)['state'], 'undone')
+            self.assertEqual(sandbox.rows, [foreign])
+            self.assertEqual(carrier.gid_active(self.root, sandbox.device.udid), [])
+
+    async def test_cleanup_discovers_manual_and_automatic_owners_after_profiles_disappear(self):
+        for no_active_sims in (False, True):
+            case = self.root / str(no_active_sims)
+            case.mkdir()
+            with self.subTest(no_active_sims=no_active_sims), Sandbox(case) as sandbox:
+                sandbox.dual_mvno()
+                sandbox.args.sims, sandbox.args.gid1_iccid = '1', True
+                await sandbox.apply()
+                await sandbox.automatic('2')
+                sandbox.rows = [] if no_active_sims else [copy.deepcopy(ROWS[0])]
+                unowned = ALIAS + '_ID-8901000000000000099'
+                sandbox.catalog[unowned] = carrier.bundle_link(BUNDLE)
+                expected = dict(sandbox.catalog)
+                for row in ROWS:
+                    expected.pop(sandbox.qualified_alias(row['IntegratedCircuitCardIdentity']))
+                expected.pop(unowned)
+                sandbox.trigger_error = no_active_sims
+                boundary = (patch.object(carrier, 'install_trigger',
+                                         side_effect=AssertionError('Unexpected no-SIM trigger'))
+                            if no_active_sims else contextlib.nullcontext())
+                with boundary:
+                    self.assertEqual(await sandbox.cleanup(), 0)
+                self.assertEqual(sandbox.catalog, expected)
+                self.assertEqual(sandbox.catalog_writes, 5)
+                for row in ROWS:
+                    record = sandbox.record(row['IntegratedCircuitCardIdentity'])
+                    self.assertEqual(record['state'], 'undone')
+                    self.assertTrue(record['rollback_verified'])
+                    self.assertEqual(record['undo_selection_status'],
+                                     'no_active_sims' if no_active_sims else 'verified')
+                    if no_active_sims:
+                        self.assertFalse(record.get('undo_result'))
+                self.assertEqual(carrier.pending(case, sandbox.device.udid), [])
+                self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
+                if no_active_sims:
+                    # Cleanup must rely on catalog/Books proof, not demand selection output.
+                    self.assertTrue(all(identities for _, identities in sandbox.rescans))
+                before = sandbox.catalog_writes
+                self.assertEqual(await sandbox.cleanup(), 0)
+                self.assertEqual(sandbox.catalog_writes, before)
+
+    async def test_cleanup_removes_an_unqualified_owned_rule_too(self):
+        with Sandbox(self.root) as sandbox:
+            await sandbox.apply()
+            sandbox.rows = []
+            self.assertEqual(await sandbox.cleanup(), 0)
+            self.assertNotIn(ALIAS, sandbox.catalog)
+            self.assertEqual(sandbox.record()['state'], 'undone')
+            self.assertEqual(sandbox.record()['undo_selection_status'], 'no_active_sims')
+            self.assertEqual(carrier.pending(self.root, sandbox.device.udid), [])
+
+    async def test_batch_install_and_multi_owner_removal_cleanup_previews_do_not_write(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            sandbox.args.status = True
+            with patch.object(carrier, 'transfer', side_effect=AssertionError('Unexpected catalog operation')), \
+                    patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.automatic(), 0)
+            self.assertEqual(list(self.root.iterdir()), [])
+            self.assertEqual(sandbox.catalog, sandbox.original)
+            sandbox.args.status = False
+            await sandbox.automatic()
+            before = dict(sandbox.catalog)
+            files = {path.relative_to(self.root): path.read_bytes()
+                     for path in self.root.rglob('*') if path.is_file()}
+            writes = sandbox.catalog_writes
+            sandbox.rows = []
+            with patch.object(carrier, 'transfer', side_effect=AssertionError('Unexpected catalog operation')), \
+                    patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.remove(status=True), 0)
+                self.assertEqual(await sandbox.cleanup(status=True), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(sandbox.catalog_writes, writes)
+            self.assertEqual({path.relative_to(self.root): path.read_bytes()
+                              for path in self.root.rglob('*') if path.is_file()}, files)
+
+    async def test_owner_follows_identity_across_slot_moves_for_rerun_and_scoped_removal(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            await sandbox.automatic()
+            first, second = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+            sandbox.row(first)['Slot'], sandbox.row(second)['Slot'] = 'kTwo', 'kOne'
+            before = dict(sandbox.catalog)
+            with patch.object(carrier, 'transfer', side_effect=AssertionError('Unexpected catalog operation')), \
+                    patch.object(carrier, 'install_trigger', side_effect=AssertionError('Unexpected trigger')):
+                self.assertEqual(await sandbox.automatic('1'), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(await sandbox.remove(sims='1'), 0)
+            self.assertNotIn(sandbox.qualified_alias(second), sandbox.catalog)
+            self.assertEqual(sandbox.record(second)['slot'], 'kTwo')
+            self.assertEqual(sandbox.record(second)['undo_result']['kOne']['selected'], 'TMobile_MVNO_US.bundle')
+            self.assertEqual(sandbox.record(second)['undo_result']['kOne']['operator']['selected'],
+                             'TMobile_MVNO_US.bundle')
+            self.assertEqual(sandbox.record(second)['undo_result']['kTwo']['selected'], BUNDLE)
+            self.assertEqual(sandbox.row(first)['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+            self.assertEqual(await sandbox.remove(sims='2'), 0)
+            self.assertEqual(sandbox.record(first)['state'], 'undone')
+
+    async def test_slot_removal_prefers_current_identity_and_never_an_active_owners_stale_slot(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            await sandbox.automatic()
+            inactive, active = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+            sandbox.rows = [sandbox.row(active)]
+            sandbox.row(active)['Slot'] = 'kOne'
+            before = dict(sandbox.catalog)
+            writes = sandbox.catalog_writes
+            self.assertEqual(await sandbox.remove(sims='2'), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(sandbox.catalog_writes, writes)
+            self.assertEqual(await sandbox.remove(sims='1'), 0)
+            self.assertNotIn(sandbox.qualified_alias(active), sandbox.catalog)
+            self.assertIn(sandbox.qualified_alias(inactive), sandbox.catalog)
+            self.assertEqual(sandbox.record(inactive)['state'], 'applied_verified')
+            # No active owner now matches; the removed profile's saved slot is eligible.
+            self.assertEqual(await sandbox.remove(sims='1'), 0)
+            self.assertNotIn(sandbox.qualified_alias(inactive), sandbox.catalog)
+            self.assertEqual(sandbox.record(inactive)['state'], 'undone')
+
+    async def test_failed_second_owner_rolls_back_only_itself_in_batch_and_sequential_installs(self):
+        for batch in (False, True):
+            case = self.root / str(batch)
+            case.mkdir()
+            with self.subTest(batch=batch), Sandbox(case) as sandbox:
+                sandbox.dual_mvno()
+                first, second = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+                if not batch:
+                    await sandbox.automatic('1')
+                sandbox.failure_modes[second] = 'operator-signature'
+                with self.assertRaises(RuntimeError):
+                    await sandbox.automatic('all' if batch else '2')
+                self.assertEqual(sandbox.alias_commits, 2)
+                self.assertEqual(sandbox.catalog_writes, 3)
+                self.assertEqual(sandbox.catalog[sandbox.qualified_alias(first)], carrier.bundle_link(BUNDLE))
+                self.assertNotIn(sandbox.qualified_alias(second), sandbox.catalog)
+                self.assertTrue(carrier.gid_healthy(sandbox.record(first)))
+                self.assertEqual(sandbox.record(second)['state'], 'rolled_back')
+                self.assertEqual(sandbox.record(second)['undo_result']['kOne']['operator']['selected'], BUNDLE)
+                self.assertEqual(sandbox.row(first)['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+                self.assertEqual(sandbox.row(second)['CFBundleIdentifier'], 'com.apple.TMobile_MVNO_US')
+                self.assertEqual(sandbox.catalog['later-change'], ('f', b'preserve this current change'))
+                self.assertEqual(carrier.gid_pending(case, sandbox.device.udid), [])
+
+    async def test_batch_sim_swap_after_first_verified_owner_stops_later_writes(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            first, second = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+            swapped = False
+
+            async def ready(*args):
+                nonlocal swapped
+                owners = list(self.root.glob('*/gid-alias.json'))
+                if not swapped and any(carrier.gid_healthy(carrier.read_json(path)) for path in owners):
+                    sandbox.row(second)['IntegratedCircuitCardIdentity'] = '8901000000000000099'
+                    swapped = True
+                return await sandbox.ready(*args)
+
+            with patch.object(carrier, 'ready_device', AsyncMock(side_effect=ready)):
+                with self.assertRaises(RuntimeError):
+                    await sandbox.automatic()
+            self.assertTrue(swapped)
+            self.assertEqual(sandbox.alias_commits, 1)
+            self.assertEqual(sandbox.catalog_writes, 1)
+            self.assertTrue(carrier.gid_healthy(sandbox.record(first)))
+            self.assertIn(sandbox.qualified_alias(first), sandbox.catalog)
+            self.assertNotIn(sandbox.qualified_alias(second), sandbox.catalog)
+
+    async def test_failed_install_never_adopts_an_unowned_alias_but_explicit_cleanup_can_remove_wholesale(self):
+        for identical in (False, True):
+            case = self.root / str(identical)
+            case.mkdir()
+            with self.subTest(identical=identical), Sandbox(case) as sandbox:
+                unowned = carrier.bundle_link(BUNDLE) if identical else ('l', b'conflicting alias')
+                sandbox.catalog[QUALIFIED_ALIAS] = unowned
+                before = dict(sandbox.catalog)
+                sandbox.args.gid1_iccid = True
+                with self.assertRaises(RuntimeError):
+                    await sandbox.apply()
+                self.assertEqual(sandbox.catalog, before)
+                self.assertFalse(sandbox.record()['ownership_established'])
+                self.assertEqual(sandbox.alias_commits, 0)
+                self.assertEqual(await sandbox.cleanup(), 0)
+                expected = dict(before)
+                if identical:
+                    expected.pop(QUALIFIED_ALIAS)
+                self.assertEqual(sandbox.catalog, expected)
+                self.assertEqual(sandbox.catalog_writes, int(identical))
+                self.assertFalse(sandbox.record()['ownership_established'])
+
+    async def test_changed_owned_alias_is_not_deleted_by_all_cleanup(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            await sandbox.automatic()
+            second = ROWS[1]['IntegratedCircuitCardIdentity']
+            sandbox.catalog[sandbox.qualified_alias(second)] = ('l', b'changed by somebody else')
+            before = dict(sandbox.catalog)
+            with self.assertRaises(RuntimeError):
+                await sandbox.cleanup()
+            self.assertEqual(sandbox.catalog, before)
+
+    async def test_unqualified_or_unfinished_owner_blocks_a_new_distinct_owner(self):
+        for unfinished in (False, True):
+            case = self.root / str(unfinished)
+            case.mkdir()
+            with self.subTest(unfinished=unfinished), Sandbox(case) as sandbox:
+                sandbox.dual_mvno()
+                first = ROWS[0]['IntegratedCircuitCardIdentity']
+                if unfinished:
+                    await sandbox.automatic('1')
+                    record = sandbox.record(first)
+                    record.update(state='apply_started', selection_verified=False)
+                    carrier.save_json(sandbox.owner(first) / 'gid-alias.json', record)
+                else:
+                    # The unqualified rule was installed before the second same-PLMN line appeared.
+                    sandbox.rows = sandbox.rows[:1]
+                    sandbox.args.sims = '1'
+                    await sandbox.apply()
+                    sandbox.rows.append(copy.deepcopy(ROWS[1]))
+                before = dict(sandbox.catalog)
+                writes = sandbox.catalog_writes
+                with self.assertRaises(RuntimeError):
+                    await sandbox.automatic('2')
+                self.assertEqual(sandbox.catalog, before)
+                self.assertEqual(sandbox.catalog_writes, writes)
+
+    async def test_generic_recovery_preserves_multiple_healthy_owners_and_removes_only_interrupted_one(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            await sandbox.automatic()
+            first, second = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+            args = SimpleNamespace(**vars(sandbox.args))
+            args.gid1, args.tmobile_wholesale, args.recover = None, False, Path('AUTO')
+            before = dict(sandbox.catalog)
+            writes = sandbox.catalog_writes
+            self.assertEqual(await carrier.execute_with_retry(args, None), 0)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(sandbox.catalog_writes, writes)
+            first_journal = (sandbox.owner(first) / 'gid-alias.json').read_bytes()
+            record = sandbox.record(second)
+            record.update(state='apply_started', selection_verified=False)
+            carrier.save_json(sandbox.owner(second) / 'gid-alias.json', record)
+            self.assertEqual(await carrier.execute_with_retry(args, None), 0)
+            self.assertEqual((sandbox.owner(first) / 'gid-alias.json').read_bytes(), first_journal)
+            self.assertIn(sandbox.qualified_alias(first), sandbox.catalog)
+            self.assertNotIn(sandbox.qualified_alias(second), sandbox.catalog)
+            self.assertEqual(sandbox.record(second)['state'], 'undone')
+            self.assertEqual(sandbox.record(second)['undo_result']['kOne']['operator']['selected'], BUNDLE)
+            self.assertEqual(sandbox.row(first)['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+            self.assertEqual(carrier.gid_pending(self.root, sandbox.device.udid), [])
+
+    async def test_duplicate_identity_or_ownership_blocks_new_writes(self):
+        for duplicate_owner in (False, True):
+            case = self.root / str(duplicate_owner)
+            case.mkdir()
+            with self.subTest(duplicate_owner=duplicate_owner), Sandbox(case) as sandbox:
+                sandbox.dual_mvno()
+                if duplicate_owner:
+                    first = ROWS[0]['IntegratedCircuitCardIdentity']
+                    await sandbox.automatic('1')
+                    shutil.copytree(sandbox.owner(first), case / 'duplicate-owner')
+                else:
+                    for key in ('InternationalMobileSubscriberIdentity', 'IntegratedCircuitCardIdentity'):
+                        sandbox.rows[1][key] = sandbox.rows[0][key]
+                before = dict(sandbox.catalog)
+                writes = sandbox.catalog_writes
+                with self.assertRaises(RuntimeError):
+                    await sandbox.automatic('2')
+                self.assertEqual(sandbox.catalog, before)
+                self.assertEqual(sandbox.catalog_writes, writes)
+
+    async def test_second_owner_disconnect_reconnects_without_replaying_either_catalog_write(self):
+        with Sandbox(self.root) as sandbox:
+            sandbox.dual_mvno()
+            first, second = (row['IntegratedCircuitCardIdentity'] for row in ROWS)
+            await sandbox.automatic('1')
+            first_journal = (sandbox.owner(first) / 'gid-alias.json').read_bytes()
+            sandbox.failure_modes[second] = 'drop'
+            self.assertEqual(await sandbox.automatic('2'), 0)
+            self.assertEqual(sandbox.catalog_writes, 2)
+            self.assertEqual(sandbox.alias_commits, 2)
+            self.assertEqual((sandbox.owner(first) / 'gid-alias.json').read_bytes(), first_journal)
+            self.assertTrue(sandbox.record(second)['verification_connection_errors'])
+            for iccid in (first, second):
+                self.assertTrue(carrier.gid_healthy(sandbox.record(iccid)))
+                self.assertIn(sandbox.qualified_alias(iccid), sandbox.catalog)
+                self.assertEqual(sandbox.row(iccid)['CFBundleIdentifier'], 'com.apple.TMobile_Wholesale_US')
+            self.assertTrue(all(client.closed for client in sandbox.clients))
+
+    async def test_cleanup_is_usb_only_even_for_preview(self):
+        with Sandbox(self.root) as sandbox:
+            await sandbox.automatic()
+            before = dict(sandbox.catalog)
+            writes = sandbox.catalog_writes
+            with patch.object(carrier, 'CONNECTION', 'WiFi'):
+                for status in (False, True):
+                    with self.subTest(status=status), self.assertRaises(RuntimeError):
+                        await sandbox.cleanup(status=status)
+            self.assertEqual(sandbox.catalog, before)
+            self.assertEqual(sandbox.catalog_writes, writes)
 
 
 if __name__ == '__main__':

@@ -472,6 +472,7 @@ class RetryTest(unittest.IsolatedAsyncioTestCase):
                                     attempts=2, runs=self.root, status=False, recover=False)
         self.args.gid1 = self.args.undo_gid1 = None
         self.args.tmobile_wholesale = self.args.remove_tmobile_wholesale = False
+        self.args.cleanup_overrides = False
         self.args.restore_backup = None
 
     async def run_case(self, error, before, after):
@@ -1027,6 +1028,7 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
                                attempts=2, runs=pathlib.Path('.'), status=False, recover=False)
         args.gid1 = args.undo_gid1 = None
         args.tmobile_wholesale = args.remove_tmobile_wholesale = False
+        args.cleanup_overrides = False
         with patch.object(carrier, 'CONNECTION', 'Network'), \
              patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
              patch.object(carrier, 'pending', return_value=[]), \
@@ -1058,6 +1060,7 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
                                attempts=1, runs=pathlib.Path('.'), status=False, recover=False)
         args.gid1 = args.undo_gid1 = None
         args.tmobile_wholesale = args.remove_tmobile_wholesale = False
+        args.cleanup_overrides = False
         with patch.object(carrier, 'CONNECTION', 'Network'), \
              patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
              patch.object(carrier, 'pending', return_value=['stage']), \
@@ -1073,6 +1076,7 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
                                attempts=1, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
         args.gid1 = args.undo_gid1 = None
         args.tmobile_wholesale = args.remove_tmobile_wholesale = False
+        args.cleanup_overrides = False
         with patch.object(carrier, 'CONNECTION', 'Network'), \
              patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
              patch.object(carrier, 'pending', return_value=['stage']), \
@@ -1087,6 +1091,7 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
                                attempts=2, runs=pathlib.Path('.'), status=False, recover=pathlib.Path('AUTO'))
         args.gid1 = args.undo_gid1 = None
         args.tmobile_wholesale = args.remove_tmobile_wholesale = False
+        args.cleanup_overrides = False
         with patch.object(carrier, 'CONNECTION', 'Network'), \
              patch.object(carrier, 'choose_device', AsyncMock(return_value='phone')), \
              patch.object(carrier, 'pending', return_value=['stage']), \
@@ -1174,7 +1179,7 @@ class AirliftClosedTest(unittest.IsolatedAsyncioTestCase):
                 'BuildVersion': build, 'ActivationState': 'Activated'}
         args = SimpleNamespace(udid='test-device', wait_seconds=0, recover=None, status=False, restore=False,
                                restore_backup=None, sims='all', bundles={'default': 'Vodafone_hu.bundle'},
-                               runs=self.runs, trigger=None)
+                               runs=self.runs, trigger=None, cleanup_overrides=False)
         args.__dict__.update(values)
         with patch.object(carrier, 'ready_device', AsyncMock(return_value=device)), \
              patch.object(carrier, 'device_info', AsyncMock(return_value=info)), \
@@ -1286,7 +1291,8 @@ class AutoRecoverTest(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name)
-        self.args = SimpleNamespace(udid='phone', wait_seconds=1, attempts=3, runs=self.root, recover=False)
+        self.args = SimpleNamespace(udid='phone', wait_seconds=1, attempts=3, runs=self.root, recover=False,
+                                    cleanup_overrides=False)
 
     async def run_case(self, errors, later):
         devices = []
@@ -1382,23 +1388,25 @@ class WholesaleLauncherTest(unittest.TestCase):
         self.assertEqual(list(inputs), [], 'The flow left user input unconsumed.')
         return operations
 
-    def test_install_and_removal_default_to_no_and_accept_explicit_yes(self):
-        for choice in ('14', '15'):
-            for answer in ('', 'n', 'yes'):
+    def test_install_removal_and_cleanup_require_explicit_yes(self):
+        for choice in ('14', '15', '16'):
+            for answer in ('', 'n', 'y', 'yes'):
                 with self.subTest(choice=choice, answer=answer):
-                    operations = self.run_menu([choice, '', answer, '', '0'])
-                    self.assertEqual(operations, ['preview', 'write'] if answer == 'yes' else ['preview'])
+                    selection = [] if choice == '16' else ['']
+                    operations = self.run_menu([choice, *selection, answer, '', '0'])
+                    self.assertEqual(operations, ['preview', 'write'] if answer in ('y', 'yes') else ['preview'])
 
     def test_noop_and_failed_preview_never_ask_to_write(self):
-        for choice in ('14', '15'):
+        for choice in ('14', '15', '16'):
             for code in (launch.NOTHING_TO_WRITE, 1):
                 with self.subTest(choice=choice, code=code):
-                    operations = self.run_menu([choice, '', '', '0'], plan_code=code)
+                    selection = [] if choice == '16' else ['']
+                    operations = self.run_menu([choice, *selection, '', '0'], plan_code=code)
                     self.assertEqual(operations, ['preview'])
 
 
-    def test_wifi_refuses_both_actions_before_slot_input(self):
-        operations = self.run_menu(['10', '14', '15', '0'])
+    def test_wifi_refuses_usb_actions_before_selection_or_preview(self):
+        operations = self.run_menu(['10', '14', '15', '16', '0'])
         self.assertEqual(operations, [])
 
     def test_wifi_guard_allows_usb_action_after_switching_back(self):

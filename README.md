@@ -41,9 +41,10 @@ If macOS blocks the launcher as an unsigned download, run `bash "Launch macOS.co
 | **10** | Switch normal operations between USB and experimental Wi-Fi |
 | **11** | Generate a read-only profile report with your manual checks |
 | **12 / 13** | Expert GID1 override / journal-bound undo; USB-only |
-| **14 / 15** | Automatic T-Mobile Wholesale installation / owned removal; USB-only |
+| **14 / 15** | Automatic T-Mobile Wholesale installation / removal; USB-only |
+| **16** | Clean up locally owned overrides and recognizable Wholesale rules; USB-only |
 
-For **12–15**, type `y` or `yes` to confirm a write; Enter cancels. Item **7** accepts a blank confirmation as yes. In **14/15**, Enter at the earlier **slot prompt** requests automatic selection, not confirmation. Command-line write actions are **noninteractive**: they do not ask for menu confirmation.
+For **12–16**, inspect the read-only preview, then type `y` or `yes` to confirm; Enter cancels. Confirmed actions can write to the phone, including native staging for discovery. Item **7** accepts a blank confirmation as yes. In **14/15**, Enter at the earlier **SIM selection prompt** means All, not confirmation. Command-line write actions are **noninteractive**: they do not ask for menu confirmation.
 
 ## Normal bundle selection
 
@@ -68,22 +69,41 @@ The second command installs; the third removes that SIM's IMSI alias only. After
 
 ## Automatic T-Mobile Wholesale
 
-Use USB and choose **14**. Automatic selection works when there is one eligible line. With multiple eligible T-Mobile lines, explicitly choose **1** or **2**. Inspect the preview, then confirm. The installation is qualified to the selected SIM; the other active slot must retain its verified carrier/operator baseline. Unsupported or ambiguous selections stop without writing.
+Use USB and choose **14**. Enter or `all` installs for all eligible active lines; choose **1** or **2** to limit installation to that slot. Inspect the preview, then confirm. Each rule uses the SIM's full ICCID (card identifier), not a prefix, so multiple lines can use Wholesale at once without changing unrelated lines. Already-Wholesale lines are not rewritten or claimed as newly owned. If a later installation fails, earlier verified installations remain applied; inspect the reported results before retrying.
 
 ```sh
 # Read-only preview
 python3 launch.py --tmobile-wholesale --status
-# Install when selection is unambiguous
+# Install for all eligible active SIMs (the default)
 python3 launch.py --tmobile-wholesale
 # Explicitly preview/install SIM 1 (use 2 for SIM 2)
 python3 launch.py --tmobile-wholesale --sims 1 --status
 python3 launch.py --tmobile-wholesale --sims 1
-# Preview/remove an owned installation; add --sims 1 or 2 if needed
-python3 launch.py --remove-tmobile-wholesale --status
-python3 launch.py --remove-tmobile-wholesale
+# Preview/remove Wholesale rules with All (the default), including absent profiles
+python3 launch.py --remove-tmobile-wholesale --sims all --status
+python3 launch.py --remove-tmobile-wholesale --sims all
 ```
 
-Use `py` instead of `python3` on Windows. Commands without `--status` above are noninteractive write actions. A successful installation stays applied without a connected computer or background program. Repeating a healthy owned installation leaves it unchanged. Use **15** or `--remove-tmobile-wholesale` for explicit removal; stock or unowned Wholesale selections are not automatically removed.
+Use `py` instead of `python3` on Windows. Commands without `--status` above are noninteractive write actions. A successful installation stays applied without a connected computer or background program. Repeating a healthy owned installation leaves it unchanged.
+
+**To remove Wholesale, use USB, choose menu 15 and select All (Enter).** This handles local installation journals, then discovers recognizable full-ICCID-qualified Wholesale rules on the phone, including installations from another computer and disabled or removed eSIMs. No old journals or active SIM are required for this discovery. The default command-line selection is also `--sims all`. Choosing **1** or **2** limits removal to locally journaled installations; it does not discover rules installed elsewhere.
+
+The preview is genuinely read-only: it cannot inventory unknown phone rules. Discovery and backup happen **only after confirmation**, using native staging that writes to the phone. Only recognizable full-ICCID GID1 rules pointing exactly to T-Mobile Wholesale qualify for journal-free removal. Unrelated rules, unqualified GID1 rules, IMSI aliases, other bundle targets and unknown files are preserved. A stock Wholesale selection without a matching catalog rule is not removed or claimed. Affected lines return to the untouched signed system bundle selected by iOS, not a promised original profile.
+
+## Clean up overrides
+
+Use USB and choose **16** to remove **locally owned GID1/ICCID overrides plus recognizable full-ICCID Wholesale rules**. This includes disabled or removed SIM/eSIM profiles and recognizable Wholesale rules installed on another computer. Other generic GID1 cleanup still requires its saved local ownership journals. Unsupported or unrecognized rules are preserved. No active SIM or operation run-directory input is required.
+
+Inspect the read-only preview, then type `y` or `yes`; Enter cancels. As with menu **15 + All**, phone-side discovery and backup happen only after confirmation and use native staging, not a read-only scan. Cleanup is explicit, not automatic when a profile disappears, and cannot distinguish disabled from removed profiles.
+
+```sh
+# Read-only preview
+python3 launch.py --cleanup-overrides --status
+# Clean up owned overrides and recognizable Wholesale rules (noninteractive)
+python3 launch.py --cleanup-overrides
+```
+
+Do not combine `--cleanup-overrides` with other actions, Wi-Fi, or `--sims 1/2`. To remove only Wholesale installations, use **15** instead.
 
 ## Read-only checks and recovery
 
@@ -99,9 +119,9 @@ python3 launch.py --recover
 
 If an operation fails, preserve the project and `runs` folder, reconnect by USB, unlock the phone and use **5** or `--recover`. Do not blindly reinstall an interrupted GID1/Wholesale operation: follow its saved recovery/undo instructions. Item **4** removes IMSI aliases only; it does not remove GID1 or Wholesale rules.
 
-Normal IMSI operations can optionally use experimental Wi-Fi after USB Trust and Finder/iTunes Wi-Fi sync setup. Keep both devices on the same non-guest network. On macOS, Terminal needs Local Network permission. If Wi-Fi fails, return to USB and recover before another write. GID1 and Wholesale installation/removal remain USB-only.
+Normal IMSI operations can optionally use experimental Wi-Fi after USB Trust and Finder/iTunes Wi-Fi sync setup. Keep both devices on the same non-guest network. On macOS, Terminal needs Local Network permission. If Wi-Fi fails, return to USB and recover before another write. GID1, Wholesale installation/removal and override cleanup remain USB-only.
 
-**Keep backups private.** `runs` contains catalog backups, device/SIM identifiers and ownership journals, including full ICCIDs in qualified rules. Do not publish it or assume masked console output makes archives safe. Preserve active Wholesale/GID1 owner journals and referenced backups when moving or upgrading the project; use `--runs PATH` if stored elsewhere. Removal depends on those records.
+**Keep backups private.** `runs` contains catalog backups, device/SIM identifiers and journals, including full ICCIDs in qualified rules. Do not publish it or assume masked console output makes archives safe. Preserve journals and referenced backups for recovery and local-ownership-scoped cleanup when moving or upgrading the project; use `--runs PATH` if stored elsewhere. Menu **15 + All** and **16** can discover recognizable Wholesale rules without old journals, but unrelated generic GID1 cleanup still depends on them.
 
 ## Compatibility and service safety
 

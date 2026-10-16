@@ -141,7 +141,8 @@ def menu(wifi=False):
           '  12  Experimental GID1 override · USB only\n'
           '  13  Undo GID1 override using run directory · USB only\n'
           '  14  Automatic T-Mobile Wholesale installation · USB only\n'
-          '  15  Remove owned T-Mobile Wholesale installation · USB only\n\n'
+          '  15  Remove T-Mobile Wholesale rules · USB only\n'
+          '  16  Clean up owned overrides and recognizable Wholesale rules · USB only\n\n'
           '  CHECKS AND REPORTS · read-only\n'
           '   2  View SIMs and installation plan\n'
           '   3  Check computer and files\n'
@@ -171,12 +172,13 @@ def menu(wifi=False):
                 print('  GID1 apply and undo require USB. Switch to USB with menu 10 first.')
                 continue
             return gid_override() if choice == '12' else undo_gid_override()
-        if choice in ('14', '15'):
+        if choice in ('14', '15', '16'):
             if wifi:
-                print('  T-Mobile Wholesale installation and removal require USB. Switch with menu 10 first.')
+                print('  Wholesale installation, removal and override cleanup require USB. Switch with menu 10 first.')
                 continue
+            if choice == '16': return cleanup_overrides()
             return wholesale_profile(remove=choice == '15')
-        print('Enter a number from 0 to 15. Installation has not started.')
+        print('Enter a number from 0 to 16. Installation has not started.')
 
 
 def other_profile():
@@ -240,17 +242,31 @@ def undo_gid_override():
     return ('gid-confirm', ['--undo-gid1', directory])
 
 def wholesale_profile(remove=False):
-    print('\n  Remove only an owned T-Mobile Wholesale installation.' if remove else
-          '\n  Automatically identify an eligible T-Mobile SIM and install T-Mobile Wholesale.')
-    print('  Enter selects automatically; use 1 or 2 to select a specific SIM slot.\n'
-          '  A read-only preview runs before confirmation. No identifiers or run directory are needed.')
+    print('\n  Remove T-Mobile Wholesale rules, including disabled or removed eSIMs.' if remove else
+          '\n  Install T-Mobile Wholesale for all eligible active SIMs, or choose one slot.')
+    print('  Enter or all includes recognizable full-ICCID Wholesale rules from any computer.\n'
+          '  Choosing 1 or 2 removes only locally journaled installations for that slot.\n'
+          '  Unknown phone rules are discovered and backed up only after confirmation;\n'
+          '  discovery uses native staging and is not read-only. Other rules stay untouched.' if remove else
+          '  Enter or all selects all eligible SIMs.')
+    print('  A read-only preview runs before confirmation. No identifiers or run directory are needed.')
     while True:
-        slot = input('  SIM slot (Enter — auto, 1 or 2): ').strip()
-        if slot in ('', '1', '2'): break
-        print('  Enter 1, 2, or press Enter for automatic selection.')
-    args = ['--remove-tmobile-wholesale' if remove else '--tmobile-wholesale']
-    if slot: args.extend(['--sims', slot])
+        slot = input('  SIM selection (Enter/all, 1 or 2): ').strip().lower()
+        if slot in ('', 'all', '1', '2'): break
+        print('  Enter 1, 2, all, or press Enter for all.')
+    args = ['--remove-tmobile-wholesale' if remove else '--tmobile-wholesale',
+            '--sims', slot or 'all']
     return ('wholesale-confirm', args)
+
+
+def cleanup_overrides():
+    print('\n  Remove locally owned GID1/ICCID overrides and recognizable full-ICCID Wholesale rules,\n'
+          '  including rules from another computer and disabled or removed eSIMs.\n'
+          '  Other GID1 cleanup still needs local journals; unsupported rules stay untouched.\n'
+          '  No SIM or run directory selection is needed. The preview is read-only.\n'
+          '  Phone-side discovery and backup happen only after confirmation, using native staging.\n'
+          '  Only y/yes confirms cleanup. Enter cancels.')
+    return ('cleanup-confirm', ['--cleanup-overrides'])
 
 
 
@@ -277,7 +293,8 @@ def main():
         confirm = isinstance(args, tuple)
         gid_confirm = confirm and args[0] == 'gid-confirm'
         wholesale_confirm = confirm and args[0] == 'wholesale-confirm'
-        usb_confirm = gid_confirm or wholesale_confirm
+        cleanup_confirm = confirm and args[0] == 'cleanup-confirm'
+        usb_confirm = gid_confirm or wholesale_confirm or cleanup_confirm
         if confirm: args = args[1]
         if args == 'wifi':
             wifi = not wifi
@@ -286,7 +303,7 @@ def main():
                       '  First pair over USB and enable “Show this iPhone when on Wi-Fi”\n'
                       '  in Finder/iTunes. Use the same network as the computer.\n'
                       '  Start with menu 2, then 1. See the README section about --wifi.\n'
-                      '  GID1 and T-Mobile Wholesale installation/removal always require USB.')
+                      '  GID1, Wholesale installation/removal and override cleanup always require USB.')
             continue
         if usb_confirm and wifi:
             print('This operation requires USB. Switch to USB with menu 10 first.')
@@ -304,6 +321,8 @@ def main():
             if code == NOTHING_TO_WRITE:
                 print('\n  Nothing to write; installation was not started. See the reason above.'); code = 0
             elif confirm and not code and not ask_yes(
+                    '\n  Confirm override and Wholesale cleanup? y/yes confirms; Enter cancels [NO]: '
+                    if cleanup_confirm else
                     '\n  Confirm this T-Mobile Wholesale installation/removal? y/yes confirms; Enter cancels [NO]: '
                     if wholesale_confirm else
                     '\n  Confirm this GID1 apply/undo operation? y/yes confirms; Enter cancels [NO]: ' if gid_confirm
